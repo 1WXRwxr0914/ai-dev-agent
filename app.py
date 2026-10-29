@@ -19,6 +19,7 @@ import os
 import tempfile
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
@@ -86,6 +87,24 @@ DEBT_STYLE = {
     "TODO": "background-color: #fff4e0; color: #b26a00; font-weight: 600;",
     "FIXME": "background-color: #fdecea; color: #c62828; font-weight: 600;",
 }
+
+# 图表配色：级别颜色沿用页面已有的红/橙/绿语义色，
+# 普通柱使用中性蓝，仅超限柱切换为红色（强调而不是分类）。
+SEVERITY_ORDER = [
+    SEVERITY_TEXT[Severity.HIGH],
+    SEVERITY_TEXT[Severity.MEDIUM],
+    SEVERITY_TEXT[Severity.LOW],
+]
+SEVERITY_COLORS = {
+    SEVERITY_TEXT[Severity.HIGH]: "#c62828",
+    SEVERITY_TEXT[Severity.MEDIUM]: "#b26a00",
+    SEVERITY_TEXT[Severity.LOW]: "#2e7d32",
+}
+CHART_BLUE = "#2a78d6"
+CHART_RED = "#c62828"
+CHART_INK = "#374151"
+CHART_MUTED = "#6b7280"
+CHART_GRID = "#e5e7eb"
 _CARD_CSS = (
     "border-radius: 12px; padding: 14px 18px; height: 100%;"
     "border: 1px solid rgba(0, 0, 0, 0.08);"
@@ -217,6 +236,87 @@ def render_summary(report: ScanReport) -> None:
         render_stat_card("问题统计", str(report.total_issues), "#f8fafc", "#1f2937", note)
 
     st.progress(min(max(report.score, 0), 100) / 100)
+
+
+def build_severity_chart(report: ScanReport) -> alt.LayerChart | None:
+    """构建高/中/低危漏洞占比环形图；没有问题时返回 None。"""
+    counts = report.counts
+    data = pd.DataFrame(
+        {
+            "级别": SEVERITY_ORDER,
+            "数量": [counts["high"], counts["medium"], counts["low"]],
+        }
+    )
+    total = int(data["数量"].sum())
+    if total == 0:
+        return None
+    data["占比"] = data["数量"] / total
+    data["排序"] = range(len(data))
+    visible = data[data["数量"] > 0]
+
+    arcs = (
+        alt.Chart(visible)
+        .mark_arc(innerRadius=62, outerRadius=102, stroke="#ffffff", strokeWidth=2)
+        .encode(
+            theta=alt.Theta("数量:Q", stack=True),
+            order=alt.Order("排序:Q"),
+            color=alt.Color(
+                "级别:N",
+                scale=alt.Scale(
+                    domain=SEVERITY_ORDER,
+                    range=[SEVERITY_COLORS[level] for level in SEVERITY_ORDER],
+                ),
+                legend=alt.Legend(
+                    title=None,
+                    orient="bottom",
+                    direction="horizontal",
+                    symbolType="circle",
+                    symbolSize=110,
+                    labelFontSize=12,
+                    labelColor=CHART_INK,
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("级别:N", title="级别"),
+                alt.Tooltip("数量:Q", title="问题数"),
+                alt.Tooltip("占比:Q", title="占比", format=".1%"),
+            ],
+        )
+    )
+    labels = (
+        alt.Chart(visible)
+        .mark_text(
+            radius=121,
+            fontSize=11,
+            fontWeight="bold",
+            color=CHART_INK,
+        )
+        .encode(
+            theta=alt.Theta("数量:Q", stack=True),
+            order=alt.Order("排序:Q"),
+            text=alt.Text("占比:Q", format=".0%"),
+        )
+    )
+    return (
+        alt.layer(arcs, labels)
+        .resolve_scale(theta="shared")
+        .properties(height=280, background="transparent")
+        .configure_view(strokeWidth=0)
+    )
+
+
+def render_severity_chart(report: ScanReport) -> None:
+    """展示漏洞级别分布饼图。"""
+    st.subheader("🥧 漏洞级别分布")
+    chart = build_severity_chart(report)
+    if chart is None:
+        st.info("未发现漏洞，暂无可展示的级别分布。")
+        return
+    st.altair_chart(chart, width="stretch", theme=None)
+    st.caption(
+        f"共 {report.total_issues} 个问题：高危 {report.counts['high']} · "
+        f"中危 {report.counts['medium']} · 低危 {report.counts['low']}。"
+    )
 
 
 def build_issue_table(report: ScanReport) -> pd.DataFrame:
@@ -574,6 +674,114 @@ def render_context_summary(report: ContextHealthReport) -> None:
         render_stat_card("FIXME 债务", str(report.fixme_count), "#fdecea", "#c62828", "待修复缺陷")
 
 
+def build_file_line_chart(report: ContextHealthReport) -> alt.LayerChart:
+    """构建文件行数横向柱状图，超过阈值的柱子标红。"""
+    data = pd.DataFrame(
+        [
+            {
+                "文件": item.path,
+                "行数": item.line_count,
+                "状态": f"超过 {LINE_THRESHOLD} 行" if item.is_oversized else "正常",
+                "文件大小": _format_size(item.size_bytes),
+            }
+            for item in report.files
+        ]
+    )
+    max_lines = max(int(data["行数"].max()), LINE_THRESHOLD)
+    x_scale = alt.Scale(domain=[0, max(LINE_THRESHOLD * 1.12, max_lines * 1.12)])
+    base = alt.Chart(data).encode(
+        y=alt.Y(
+            "文件:N",
+            sort="-x",
+            title=None,
+            axis=alt.Axis(
+                labelLimit=240,
+                labelPadding=8,
+                labelColor=CHART_INK,
+                labelFontSize=12,
+                ticks=False,
+                domain=False,
+            ),
+        ),
+        x=alt.X(
+            "行数:Q",
+            title=None,
+            scale=x_scale,
+            axis=alt.Axis(
+                grid=True,
+                gridColor=CHART_GRID,
+                gridWidth=1,
+                domain=False,
+                ticks=False,
+                labelColor=CHART_MUTED,
+                labelFontSize=11,
+            ),
+        ),
+    )
+    bars = base.mark_bar(
+        size=20,
+        cornerRadiusTopRight=4,
+        cornerRadiusBottomRight=4,
+    ).encode(
+        color=alt.Color(
+            "状态:N",
+            scale=alt.Scale(
+                domain=["正常", f"超过 {LINE_THRESHOLD} 行"],
+                range=[CHART_BLUE, CHART_RED],
+            ),
+            legend=alt.Legend(
+                title=None,
+                orient="bottom",
+                direction="horizontal",
+                symbolType="square",
+                symbolSize=100,
+                labelFontSize=12,
+                labelColor=CHART_INK,
+            ),
+        ),
+        tooltip=[
+            alt.Tooltip("文件:N", title="文件"),
+            alt.Tooltip("行数:Q", title="行数"),
+            alt.Tooltip("文件大小:N", title="文件大小"),
+            alt.Tooltip("状态:N", title="状态"),
+        ],
+    )
+    threshold = (
+        alt.Chart(pd.DataFrame({"阈值": [LINE_THRESHOLD]}))
+        .mark_rule(color="#9ca3af", strokeDash=[5, 4], strokeWidth=1)
+        .encode(x=alt.X("阈值:Q", scale=x_scale))
+    )
+    layers = [bars, threshold]
+    if len(data) <= 12:
+        layers.append(
+            base.mark_text(
+                align="left",
+                baseline="middle",
+                dx=5,
+                color=CHART_INK,
+                fontSize=11,
+            ).encode(text=alt.Text("行数:Q"))
+        )
+    height = min(max(220, 30 * len(data) + 30), 620)
+    return (
+        alt.layer(*layers)
+        .properties(height=height, background="transparent")
+        .configure_view(strokeWidth=0)
+    )
+
+
+def render_file_line_chart(report: ContextHealthReport) -> None:
+    """展示每个 .py 文件的行数柱状图。"""
+    st.subheader("📏 文件行数分布")
+    if not report.files:
+        st.info("没有可展示的 .py 文件。")
+        return
+    st.altair_chart(build_file_line_chart(report), width="stretch", theme=None)
+    st.caption(
+        f"红色柱子表示超过 {LINE_THRESHOLD} 行；虚线为 {LINE_THRESHOLD} 行拆分阈值。"
+    )
+
+
 def render_oversize_warnings(report: ContextHealthReport) -> None:
     """对超过行数阈值的文件逐条给出红色预警。"""
     st.subheader("🚨 上下文污染预警")
@@ -665,6 +873,8 @@ def render_context_page() -> None:
     )
     render_context_summary(report)
     st.divider()
+    render_file_line_chart(report)
+    st.divider()
     render_oversize_warnings(report)
     st.divider()
     render_context_files(report)
@@ -702,6 +912,8 @@ def render_scan_page(api_key: str) -> None:
         f"耗时 {report.elapsed:.3f}s"
     )
     render_summary(report)
+    st.divider()
+    render_severity_chart(report)
     st.divider()
     render_issues(report)
     render_ai_fix(report, source, filename, api_key)
