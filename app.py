@@ -1,10 +1,13 @@
-"""AI 代码安全预检 Agent 的 Streamlit 演示界面。
+"""AI 代码安全预检 Agent 的 Streamlit 演示界面（双引擎）。
 
 启动方式:
     streamlit run app.py
 
-上传的 .py 文件会先写入临时目录，再交给 checker.CheckEngine 做静态扫描；
-扫描过程只解析 AST，不会执行上传的代码。
+双引擎：
+1. 安全扫描与修复：上传的 .py 文件会先写入临时目录，再交给
+   checker.CheckEngine 做 AST 静态扫描，不会执行上传的代码；
+2. 上下文健康检查：扫描项目目录内的 .py 文件，统计行数与体积，
+   对超过 300 行的大文件给出上下文污染预警，并汇总 TODO / FIXME 债务。
 """
 
 from __future__ import annotations
@@ -21,9 +24,32 @@ import requests
 import streamlit as st
 
 from checker import CheckEngine, ScanReport, Severity
+from checker.context_health import (
+    LINE_THRESHOLD,
+    ContextHealthReport,
+    resolve_target,
+    scan_context_health,
+)
 
 APP_TITLE = "AI代码安全预检Agent"
 APP_SUBTITLE = "上传 Python 文件，快速发现安全风险与代码异味"
+
+PAGE_SCAN = "🛡️ 安全扫描与修复"
+PAGE_CONTEXT = "📊 上下文健康检查"
+PAGE_META = {
+    PAGE_SCAN: ("🛡️", APP_TITLE, APP_SUBTITLE),
+    PAGE_CONTEXT: (
+        "📊",
+        "AI 上下文健康检查",
+        "扫描目录体积与 TODO / FIXME 债务，防止代码撑爆 AI 的 Token 窗口",
+    ),
+}
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+_scan_root_env = os.getenv("CONTEXT_SCAN_ROOT", "").strip()
+CONTEXT_SCAN_ROOT = (
+    Path(_scan_root_env).expanduser().resolve() if _scan_root_env else PROJECT_ROOT
+)
 
 # 演示账号；可通过环境变量覆盖（比赛提交时把账号密码随链接一并提供即可）。
 LOGIN_USER = os.getenv("APP_LOGIN_USER", "admin")
@@ -55,6 +81,10 @@ RISK_STYLE = {
     "中危": ("#fff4e0", "#b26a00"),
     "低危": ("#e8f5e9", "#2e7d32"),
     "安全": ("#e8f5e9", "#2e7d32"),
+}
+DEBT_STYLE = {
+    "TODO": "background-color: #fff4e0; color: #b26a00; font-weight: 600;",
+    "FIXME": "background-color: #fdecea; color: #c62828; font-weight: 600;",
 }
 _CARD_CSS = (
     "border-radius: 12px; padding: 14px 18px; height: 100%;"
@@ -125,13 +155,27 @@ def risk_level(report: ScanReport) -> str:
     return "安全"
 
 
-def render_header() -> None:
-    """渲染标题与说明。"""
+def render_sidebar() -> str:
+    """渲染左侧功能导航，返回当前选中的页面。"""
+    with st.sidebar:
+        st.markdown("### 🧭 功能导航")
+        page = st.radio(
+            "功能导航",
+            list(PAGE_META),
+            key="active_page",
+            label_visibility="collapsed",
+        )
+    return page
+
+
+def render_header(page: str) -> None:
+    """渲染当前页面的标题与说明。"""
+    icon, title, subtitle = PAGE_META[page]
     st.markdown(
         f"""
         <div style="text-align: center; padding: 1.2rem 0 0.4rem 0;">
-            <h1 style="margin-bottom: 0.3rem;">🛡️ {APP_TITLE}</h1>
-            <p style="color: #6b7280; font-size: 1.05rem; margin-top: 0;">{APP_SUBTITLE}</p>
+            <h1 style="margin-bottom: 0.3rem;">{icon} {title}</h1>
+            <p style="color: #6b7280; font-size: 1.05rem; margin-top: 0;">{subtitle}</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -235,14 +279,19 @@ def render_api_config() -> str:
         model = st.text_input("模型名称", value=DEEPSEEK_MODEL)
         st.caption("接口地址：`DEEPSEEK_API_URL` 环境变量可覆盖。")
         st.session_state["deepseek_model"] = model.strip() or DEEPSEEK_MODEL
+    return typed.strip() or env_key
 
+
+def render_account_panel() -> None:
+    """在侧边栏展示当前账号与退出登录按钮（两个页面都可见）。"""
+    with st.sidebar:
         st.divider()
         st.caption(f"当前账号：{st.session_state.get('login_user', '')}")
         if st.button("退出登录", use_container_width=True):
             st.session_state.pop("authenticated", None)
             st.session_state.pop("login_user", None)
+            st.session_state.pop("active_page", None)
             st.rerun()
-    return typed.strip() or env_key
 
 
 def extract_code_snippet(source: str, line: int) -> tuple[int, int, str]:
@@ -444,17 +493,188 @@ def render_ai_fix(report: ScanReport, source: str, filename: str, api_key: str) 
         st.caption("点击上方按钮开始修复。")
 
 
-def main() -> None:
-    """页面入口。"""
-    st.set_page_config(page_title=APP_TITLE, page_icon="🛡️", layout="centered")
+def _format_size(size_bytes: int) -> str:
+    """把字节数格式化为易读的体积。"""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes / (1024 * 1024):.2f} MB"
 
-    if not is_authenticated():
-        render_login()
-        st.stop()
 
-    render_header()
-    api_key = render_api_config()
+def build_context_table(report: ContextHealthReport) -> pd.DataFrame:
+    """把文件体积与债务统计转换为表格。"""
+    rows = [
+        {
+            "文件": item.path,
+            "总行数": item.line_count,
+            "文件大小": _format_size(item.size_bytes),
+            "TODO": item.todo_count,
+            "FIXME": item.fixme_count,
+            "状态": f"⚠️ 超过 {LINE_THRESHOLD} 行" if item.is_oversized else item.status,
+        }
+        for item in report.files
+    ]
+    return pd.DataFrame(rows)
 
+
+def build_debt_table(report: ContextHealthReport) -> pd.DataFrame:
+    """把 TODO / FIXME 明细转换为表格。"""
+    rows = [
+        {
+            "文件": item.file,
+            "行号": item.line,
+            "类型": item.kind,
+            "注释内容": item.text,
+        }
+        for item in report.debt_items
+    ]
+    return pd.DataFrame(rows)
+
+
+def _style_context_row(row: pd.Series) -> list[str]:
+    """超过阈值的文件整行标红。"""
+    status = str(row.get("状态", ""))
+    if status.startswith("⚠️") or status == "读取失败":
+        return ["background-color: #fdecea; color: #b71c1c; font-weight: 600;"] * len(row)
+    return [""] * len(row)
+
+
+def render_context_summary(report: ContextHealthReport) -> None:
+    """展示文件数量、代码总量与代码债务的统计卡片。"""
+    oversized = len(report.oversized_files)
+    warn_bg, warn_fg = ("#fdecea", "#c62828") if oversized else ("#e8f5e9", "#2e7d32")
+
+    first, second, third = st.columns(3)
+    with first:
+        render_stat_card(
+            "扫描文件", f"{len(report.files)} 个", "#f8fafc", "#1f2937", f"目录：{report.target}"
+        )
+    with second:
+        render_stat_card(
+            "代码总量",
+            f"{report.total_lines:,} 行",
+            "#f8fafc",
+            "#1f2937",
+            f"合计体积 {_format_size(report.total_size_bytes)}",
+        )
+    with third:
+        render_stat_card(
+            f"超过 {LINE_THRESHOLD} 行",
+            f"{oversized} 个",
+            warn_bg,
+            warn_fg,
+            "大文件会严重挤占 Token 窗口",
+        )
+
+    todo_col, fixme_col = st.columns(2)
+    with todo_col:
+        render_stat_card("TODO 债务", str(report.todo_count), "#fff4e0", "#b26a00", "待完成事项")
+    with fixme_col:
+        render_stat_card("FIXME 债务", str(report.fixme_count), "#fdecea", "#c62828", "待修复缺陷")
+
+
+def render_oversize_warnings(report: ContextHealthReport) -> None:
+    """对超过行数阈值的文件逐条给出红色预警。"""
+    st.subheader("🚨 上下文污染预警")
+    if not report.oversized_files:
+        st.success(f"全部文件均未超过 {LINE_THRESHOLD} 行，上下文体积健康 ✅")
+        return
+    for item in report.oversized_files:
+        st.error(
+            f"【上下文污染预警】{item.path} 超过 {LINE_THRESHOLD} 行，"
+            "会严重挤占 AI 的 Token 窗口，建议拆分！"
+        )
+
+
+def render_context_files(report: ContextHealthReport) -> None:
+    """用表格展示每个文件的行数、体积与债务数量。"""
+    st.subheader("📁 文件体积与债务概览")
+    frame = build_context_table(report)
+    if frame.empty:
+        st.warning("没有可展示的 .py 文件。")
+        return
+    st.dataframe(
+        frame.style.apply(_style_context_row, axis=1),
+        width="stretch",
+        hide_index=True,
+    )
+    for item in report.files:
+        if item.read_error:
+            st.warning(f"无法读取 {item.path}：{item.read_error}")
+
+
+def render_context_debt(report: ContextHealthReport) -> None:
+    """展示所有 TODO / FIXME 注释明细。"""
+    st.subheader("🧾 代码债务明细")
+    frame = build_debt_table(report)
+    if frame.empty:
+        st.success("未发现 TODO / FIXME 注释 ✅")
+        return
+    styled = frame.style.map(lambda value: DEBT_STYLE.get(value, ""), subset=["类型"])
+    st.dataframe(styled, width="stretch", hide_index=True)
+    st.caption(
+        f"共 {report.total_debt} 条代码债务：TODO {report.todo_count} 条 · "
+        f"FIXME {report.fixme_count} 条。"
+    )
+
+
+def render_context_page() -> None:
+    """渲染上下文健康检查页面。"""
+    with st.form("context_health_form"):
+        folder = st.text_input(
+            "要扫描的文件夹路径",
+            value="sample_code",
+            placeholder="例如 sample_code",
+            help="相对路径按项目根目录解析；为保证部署安全，不允许扫描项目目录之外的位置。",
+        )
+        submitted = st.form_submit_button(
+            "🔍 开始上下文健康检查",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if not submitted:
+        st.info("输入项目内的文件夹路径（例如 `sample_code`）后开始检查。")
+        st.caption(
+            f"检查规则：统计每个 .py 文件的行数与体积；超过 {LINE_THRESHOLD} 行立即预警；"
+            "并扫描所有 TODO / FIXME 注释。"
+        )
+        return
+
+    try:
+        target = resolve_target(folder, CONTEXT_SCAN_ROOT)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    with st.spinner("正在检查上下文健康度..."):
+        try:
+            report = scan_context_health(target)
+        except (OSError, ValueError) as exc:
+            st.error(f"检查失败：{exc}")
+            return
+
+    if not report.files:
+        st.warning("该文件夹下没有找到 .py 文件。")
+        return
+
+    st.caption(
+        f"已扫描 **{report.target}** · {len(report.files)} 个文件 · "
+        f"耗时 {report.elapsed:.3f}s"
+    )
+    render_context_summary(report)
+    st.divider()
+    render_oversize_warnings(report)
+    st.divider()
+    render_context_files(report)
+    st.divider()
+    render_context_debt(report)
+    st.caption("⚠️ 上下文健康建议仅供参考，请结合项目实际情况决定是否拆分文件。")
+
+
+def render_scan_page(api_key: str) -> None:
+    """渲染安全扫描与修复页面（原有功能）。"""
     uploaded = st.file_uploader(
         "上传需要预检的 Python 文件（仅支持 .py）",
         type=["py"],
@@ -486,6 +706,27 @@ def main() -> None:
     render_issues(report)
     render_ai_fix(report, source, filename, api_key)
     st.caption("⚠️ 预检结果与 AI 修复建议仅供参考，请结合人工复核后再合并代码。")
+
+
+def main() -> None:
+    """页面入口。"""
+    st.set_page_config(page_title=APP_TITLE, page_icon="🛡️", layout="centered")
+
+    if not is_authenticated():
+        render_login()
+        st.stop()
+
+    page = render_sidebar()
+    render_header(page)
+
+    if page == PAGE_CONTEXT:
+        render_context_page()
+        render_account_panel()
+        return
+
+    api_key = render_api_config()
+    render_account_panel()
+    render_scan_page(api_key)
 
 
 main()
