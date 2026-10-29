@@ -31,6 +31,14 @@ _SECRET_PLACEHOLDER = re.compile(
 _TODO = re.compile(r"#.*\b(TODO|FIXME|XXX|HACK)\b", re.IGNORECASE)
 _DANGEROUS_CALLS = frozenset({"eval", "exec"})
 _MUTABLE_FACTORIES = frozenset({"list", "dict", "set"})
+_EXTERNAL_HTTP_METHODS = frozenset(
+    {"get", "post", "put", "patch", "delete", "head", "options", "request"}
+)
+_EXTERNAL_HTTP_MODULES = frozenset({"requests", "httpx", "aiohttp"})
+_SUBPROCESS_METHODS = frozenset(
+    {"run", "call", "check_call", "check_output", "Popen"}
+)
+_TRY_NODES = (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
 
 
 @dataclass
@@ -356,4 +364,85 @@ def check_file_length(ctx: RuleContext) -> Iterable[Finding]:
             1,
             f"文件共 {len(ctx.lines)} 行，建议不超过 {MAX_FILE_LINES} 行",
             "按职责拆分模块",
+        )
+
+
+def _dotted_name(node: ast.AST) -> str:
+    """还原调用表达式的点分名称，无法还原时返回空串。"""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return ""
+
+
+def _is_external_call(node: ast.Call) -> bool:
+    """判断是否为常见网络/外部进程调用。"""
+    name = _dotted_name(node.func)
+    if not name:
+        return False
+    root = name.split(".")[0]
+    last = name.rsplit(".", 1)[-1]
+    if root in _EXTERNAL_HTTP_MODULES and last in _EXTERNAL_HTTP_METHODS:
+        return True
+    if name in {"urlopen", "urllib.request.urlopen", "urllib3.urlopen"}:
+        return True
+    if root == "socket" and last == "create_connection":
+        return True
+    if root == "subprocess" and last in _SUBPROCESS_METHODS:
+        return True
+    if root == "os" and last in {"system", "popen"}:
+        return True
+    return False
+
+
+def _build_parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    """构建 AST 父节点映射。"""
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+    return parents
+
+
+def _is_caught(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    """判断节点是否位于带 except 的 try 语句体中。"""
+    child = node
+    current = parents.get(child)
+    while current is not None:
+        if isinstance(
+            current,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef),
+        ):
+            # 外层 try 无法捕获嵌套函数/类真正执行时才发生的异常。
+            return False
+        if (
+            isinstance(current, _TRY_NODES)
+            and current.handlers
+            and child in current.body
+        ):
+            return True
+        child = current
+        current = parents.get(current)
+    return False
+
+
+@rule("PE017", "未捕获外部调用", Severity.MEDIUM)
+def check_uncaught_external_call(ctx: RuleContext) -> Iterable[Finding]:
+    parents = _build_parents(ctx.tree)
+    for node in ast.walk(ctx.tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not _is_external_call(node):
+            continue
+        if _is_caught(node, parents):
+            continue
+        name = _dotted_name(node.func) or "外部调用"
+        yield Finding(
+            node.lineno,
+            f"外部调用 {name}() 未被 try/except 捕获，失败时可能导致流程中断",
+            "使用 try/except 捕获网络或进程异常，并设置超时与重试",
         )

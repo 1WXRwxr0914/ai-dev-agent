@@ -16,7 +16,10 @@ import ast
 import hashlib
 import hmac
 import os
+import shutil
 import tempfile
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import altair as alt
@@ -24,7 +27,22 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from checker import CheckEngine, ScanReport, Severity
+from checker import (
+    CheckEngine,
+    ReviewPriority,
+    ScanReport,
+    Severity,
+    render_context_markdown,
+    render_scan_markdown,
+)
+from checker.archive import extract_python_files
+from checker.dependencies import (
+    DependencyReport,
+    ImportReference,
+    PackageStatus,
+    extract_imports,
+    verify_dependencies,
+)
 from checker.context_health import (
     LINE_THRESHOLD,
     ContextHealthReport,
@@ -33,7 +51,7 @@ from checker.context_health import (
 )
 
 APP_TITLE = "AI代码安全预检Agent"
-APP_SUBTITLE = "上传 Python 文件，快速发现安全风险与代码异味"
+APP_SUBTITLE = "上传 Python 文件或 ZIP，发现安全风险、代码异味与幻觉依赖"
 
 PAGE_SCAN = "🛡️ 安全扫描与修复"
 PAGE_CONTEXT = "📊 上下文健康检查"
@@ -77,6 +95,11 @@ SEVERITY_STYLE = {
     "中危": "background-color: #fff4e0; color: #b26a00; font-weight: 600;",
     "低危": "background-color: #e8f5e9; color: #2e7d32; font-weight: 600;",
 }
+PRIORITY_STYLE = {
+    "P0": "background-color: #fdecea; color: #c62828; font-weight: 700;",
+    "P1": "background-color: #fff4e0; color: #b26a00; font-weight: 600;",
+    "P2": "background-color: #e8f5e9; color: #2e7d32; font-weight: 600;",
+}
 RISK_STYLE = {
     "高危": ("#fdecea", "#c62828"),
     "中危": ("#fff4e0", "#b26a00"),
@@ -86,6 +109,11 @@ RISK_STYLE = {
 DEBT_STYLE = {
     "TODO": "background-color: #fff4e0; color: #b26a00; font-weight: 600;",
     "FIXME": "background-color: #fdecea; color: #c62828; font-weight: 600;",
+}
+DEPENDENCY_STYLE = {
+    "✅ 存在": "background-color: #e8f5e9; color: #2e7d32; font-weight: 600;",
+    "❌ 幻觉依赖风险": "background-color: #fdecea; color: #c62828; font-weight: 600;",
+    "⚠️ 未验证": "background-color: #fff4e0; color: #b26a00; font-weight: 600;",
 }
 
 # 图表配色：级别颜色沿用页面已有的红/橙/绿语义色，
@@ -153,13 +181,47 @@ def render_login() -> None:
         st.error("账号或密码错误，请重新输入。")
 
 
-def scan_uploaded_file(filename: str, content: bytes) -> ScanReport:
-    """把上传内容写入临时 .py 文件，调用现有引擎扫描后返回报告。"""
+@dataclass
+class UploadedScan:
+    """一次上传扫描的结果，附带后续 AI 修复需要的文件源码。"""
+
+    report: ScanReport
+    sources: dict[str, str]
+    is_archive: bool = False
+
+
+def scan_uploaded_file(filename: str, content: bytes) -> UploadedScan:
+    """扫描上传的单个 .py 文件或 .zip 压缩包，返回汇总报告与源码映射。"""
     safe_name = Path(filename).name or "uploaded.py"
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in {".py", ".zip"}:
+        raise ValueError("仅支持 .py 文件或 .zip 压缩包。")
+
     with tempfile.TemporaryDirectory(prefix="precheck_") as tmp_dir:
-        path = Path(tmp_dir) / safe_name
+        root = Path(tmp_dir)
+
+        if suffix == ".zip":
+            paths = extract_python_files(content, root)
+            report = CheckEngine(display_root=root).run(root)
+            if not report.files:
+                raise ValueError(
+                    "压缩包内没有可扫描的 .py 文件（可能都位于被排除的目录中）。"
+                )
+            sources = {
+                path.relative_to(root).as_posix(): path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                for path in paths
+            }
+            return UploadedScan(report, sources, is_archive=True)
+
+        path = root / safe_name
         path.write_bytes(content)
-        return CheckEngine().run(path)
+        report = CheckEngine(display_root=root).run(path)
+        return UploadedScan(
+            report,
+            {safe_name: content.decode("utf-8", errors="replace")},
+        )
 
 
 def risk_level(report: ScanReport) -> str:
@@ -320,10 +382,26 @@ def render_severity_chart(report: ScanReport) -> None:
 
 
 def build_issue_table(report: ScanReport) -> pd.DataFrame:
-    """把扫描结果转换为表格数据。"""
+    """把扫描结果转换为表格数据，并按审查优先级排序。"""
+    issues = [
+        issue
+        for file_report in report.files
+        for issue in file_report.issues
+    ]
+    issues.sort(
+        key=lambda issue: (
+            issue.priority.rank,
+            -issue.severity.weight,
+            issue.file,
+            issue.line,
+            issue.rule,
+        )
+    )
     rows = [
         {
+            "文件": issue.file,
             "级别": SEVERITY_TEXT[issue.severity],
+            "审查优先级": issue.priority.value,
             "行号": issue.line if issue.line > 0 else "文件级",
             "规则": issue.rule,
             "检查项": issue.name,
@@ -331,14 +409,13 @@ def build_issue_table(report: ScanReport) -> pd.DataFrame:
             "代码片段": issue.evidence,
             "修复建议": issue.suggestion,
         }
-        for file_report in report.files
-        for issue in file_report.issues
+        for issue in issues
     ]
     return pd.DataFrame(rows)
 
 
 def render_issues(report: ScanReport) -> None:
-    """用表格展示漏洞明细；高危标红、低危标绿。"""
+    """用表格展示漏洞明细；严重程度与审查优先级分别标色。"""
     st.subheader("漏洞明细")
     frame = build_issue_table(report)
 
@@ -349,9 +426,169 @@ def render_issues(report: ScanReport) -> None:
     styled = frame.style.map(
         lambda value: SEVERITY_STYLE.get(value, ""),
         subset=["级别"],
+    ).map(
+        lambda value: PRIORITY_STYLE.get(value, ""),
+        subset=["审查优先级"],
     )
     st.dataframe(styled, width="stretch", hide_index=True)
-    st.caption(f"共 {len(frame)} 条问题，按严重程度排序。")
+    st.caption(
+        f"共 {len(frame)} 条问题，默认按审查优先级排序；"
+        "点击「审查优先级」表头可重新排序。"
+        "P0=阻断合并，P1=优先审查，P2=常规审查。"
+    )
+
+
+def render_merge_block_banner(report: ScanReport) -> None:
+    """存在 P0 问题时在结果页顶部显示阻断合并横幅。"""
+    p0_issues = [
+        issue
+        for file_report in report.files
+        for issue in file_report.issues
+        if issue.priority is ReviewPriority.P0
+    ]
+    if not p0_issues:
+        return
+    files = {issue.file for issue in p0_issues}
+    st.error(
+        f"🚨 **存在阻断合并的风险**：检测到 **{len(p0_issues)}** 个 P0 级问题"
+        f"（硬编码密钥），涉及 **{len(files)}** 个文件，请修复后再合并代码。"
+    )
+
+
+def _format_dependency_locations(
+    references: list[ImportReference], limit: int = 5
+) -> str:
+    """把依赖引用位置压缩成一行。"""
+    locations = [f"{item.file}:{item.line}" for item in references]
+    if not locations:
+        return "—"
+    if len(locations) > limit:
+        return "、".join(locations[:limit]) + f" 等 {len(locations)} 处"
+    return "、".join(locations)
+
+
+def build_dependency_table(result: DependencyReport) -> pd.DataFrame:
+    """把依赖校验结果转换为表格。"""
+    rows = [
+        {
+            "依赖": item.name,
+            "PyPI 包名": item.distribution,
+            "状态": item.label,
+            "引用位置": _format_dependency_locations(
+                result.references_for(item.name), limit=3
+            ),
+        }
+        for item in sorted(
+            result.statuses.values(), key=lambda status: status.name.casefold()
+        )
+    ]
+    return pd.DataFrame(rows)
+
+
+def render_dependency_check(sources: dict[str, str]) -> DependencyReport:
+    """展示第三方依赖真实性校验结果；网络异常不影响主扫描流程。"""
+    st.divider()
+    st.subheader("📦 依赖真实性校验")
+
+    try:
+        references = extract_imports(sources)
+    except Exception as exc:  # 依赖提取失败同样不能影响主扫描结果
+        st.warning(f"依赖提取失败，已跳过：{exc}")
+        return DependencyReport()
+
+    if not references:
+        st.info(
+            "未发现需要校验的第三方依赖"
+            "（已跳过标准库、相对导入和可识别的本地模块）。"
+        )
+        st.caption("依赖校验是独立步骤，不会影响主扫描结果。")
+        return DependencyReport()
+
+    cache = st.session_state.setdefault("dependency_fetch_cache", {})
+    unique_count = len({item.name.casefold() for item in references})
+    with st.spinner(f"正在向 PyPI 校验 {unique_count} 个第三方依赖..."):
+        try:
+            result = verify_dependencies(references, cache=cache)
+        except Exception as exc:  # 依赖校验失败不能影响主扫描结果
+            st.warning(f"依赖校验发生异常，已跳过：{exc}")
+            result = DependencyReport(
+                references=references,
+                statuses={
+                    item.name.casefold(): PackageStatus(
+                        name=item.name,
+                        distribution=item.distribution,
+                        exists=None,
+                        detail=f"校验异常：{exc}",
+                    )
+                    for item in references
+                },
+            )
+
+    missing = result.missing
+    unknown = result.unknown
+    existing = result.existing
+
+    first, second, third = st.columns(3)
+    with first:
+        render_stat_card(
+            "第三方依赖",
+            str(len(result.statuses)),
+            "#f8fafc",
+            "#1f2937",
+            f"已确认存在 {len(existing)} 个",
+        )
+    with second:
+        missing_bg, missing_fg = (
+            ("#fdecea", "#c62828") if missing else ("#e8f5e9", "#2e7d32")
+        )
+        render_stat_card(
+            "幻觉依赖风险", str(len(missing)), missing_bg, missing_fg, "PyPI 返回 404"
+        )
+    with third:
+        unknown_bg, unknown_fg = (
+            ("#fff4e0", "#b26a00") if unknown else ("#e8f5e9", "#2e7d32")
+        )
+        render_stat_card(
+            "未验证", str(len(unknown)), unknown_bg, unknown_fg, "网络超时或接口异常"
+        )
+
+    frame = build_dependency_table(result)
+    if not frame.empty:
+        st.dataframe(
+            frame.style.map(
+                lambda value: DEPENDENCY_STYLE.get(value, ""), subset=["状态"]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+    if missing:
+        st.markdown("#### 🚨 幻觉依赖风险")
+        for item in sorted(missing, key=lambda status: status.name.casefold()):
+            refs = result.references_for(item.name)
+            st.error(
+                f"【幻觉依赖风险】`{item.name}` 在 PyPI 上不存在"
+                f"（查询包名：`{item.distribution}`）；"
+                f"引用位置：{_format_dependency_locations(refs, limit=8)}"
+            )
+    else:
+        st.success("未发现已确认的幻觉依赖风险 ✅")
+
+    if unknown:
+        names = "、".join(
+            item.name
+            for item in sorted(unknown, key=lambda status: status.name.casefold())
+        )
+        st.warning(f"以下依赖因网络超时或接口异常未能完成校验：{names}")
+
+    st.caption(
+        "依赖校验调用 PyPI JSON API（服务器需可访问 pypi.org），"
+        "单次总等待上限约 6 秒；网络异常只会标记为未验证，不会影响主扫描结果。"
+    )
+    if st.button("🔄 重新校验依赖", key="rerun_dependency_check"):
+        st.session_state.pop("dependency_fetch_cache", None)
+        st.rerun()
+    return result
 
 
 def _env_api_key() -> str:
@@ -388,6 +625,9 @@ def render_account_panel() -> None:
         st.divider()
         st.caption(f"当前账号：{st.session_state.get('login_user', '')}")
         if st.button("退出登录", use_container_width=True):
+            _cleanup_fix_workspace()
+            st.session_state.pop("ai_fix_scan_id", None)
+            st.session_state["ai_fix_cache"] = {}
             st.session_state.pop("authenticated", None)
             st.session_state.pop("login_user", None)
             st.session_state.pop("active_page", None)
@@ -506,7 +746,140 @@ def _fix_cache_key(source: str, rule: str, line: int) -> str:
     return f"{digest}:{rule}:{line}"
 
 
-def render_ai_fix(report: ScanReport, source: str, filename: str, api_key: str) -> None:
+def _sources_digest(sources: dict[str, str]) -> str:
+    """为一次扫描的源码集合生成稳定标识，避免跨文件复用旧备份。"""
+    digest = hashlib.sha256()
+    for name in sorted(sources):
+        digest.update(name.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        digest.update(sources[name].encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _cleanup_fix_workspace() -> None:
+    """清理本次会话的临时修复工作区和备份。"""
+    state = st.session_state
+    tmp = state.pop("fix_workspace_tmp", None)
+    if tmp is not None:
+        try:
+            tmp.cleanup()
+        except Exception:
+            pass
+    state.pop("fix_workspace_path", None)
+    state.pop("fix_workspace_scan_id", None)
+    state.pop("fix_rollback_notice", None)
+    state["fix_backups"] = {}
+    state["fix_backup_scan_id"] = None
+
+
+def _sync_fix_scan_state(scan_id: str) -> None:
+    """扫描内容变化时清理旧的修复缓存和工作区。"""
+    state = st.session_state
+    if state.get("ai_fix_scan_id") == scan_id:
+        return
+    _cleanup_fix_workspace()
+    state["ai_fix_scan_id"] = scan_id
+    state["ai_fix_cache"] = {}
+
+
+def _ensure_fix_workspace(sources: dict[str, str], scan_id: str) -> Path:
+    """创建并返回本次扫描的临时修复工作区。"""
+    state = st.session_state
+    root_value = state.get("fix_workspace_path")
+    root = Path(root_value) if root_value else None
+    if (
+        state.get("fix_workspace_scan_id") == scan_id
+        and root is not None
+        and root.is_dir()
+    ):
+        return root
+
+    _cleanup_fix_workspace()
+    tmp = tempfile.TemporaryDirectory(prefix="precheck_fix_")
+    root = Path(tmp.name).resolve()
+    for relative, source in sources.items():
+        target = (root / relative).resolve()
+        if root not in target.parents:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source, encoding="utf-8")
+    state["fix_workspace_tmp"] = tmp
+    state["fix_workspace_path"] = str(root)
+    state["fix_workspace_scan_id"] = scan_id
+    return root
+
+
+def _backup_fix_sources(sources: dict[str, str], scan_id: str) -> dict[str, str]:
+    """在调用 AI 修复前，把原文件备份为 .bak 文件。"""
+    state = st.session_state
+    existing = state.get("fix_backups")
+    root_value = state.get("fix_workspace_path")
+    root = Path(root_value) if root_value else None
+    if (
+        state.get("fix_backup_scan_id") == scan_id
+        and existing
+        and root is not None
+        and root.is_dir()
+        and all(Path(path).exists() for path in existing.values())
+    ):
+        return dict(existing)
+    if state.get("fix_backup_scan_id") == scan_id and existing:
+        # 备份或工作区不完整时从当前扫描的原始源码重建，避免备份被污染。
+        _cleanup_fix_workspace()
+
+    root = _ensure_fix_workspace(sources, scan_id)
+    backups: dict[str, str] = {}
+    for relative, source in sources.items():
+        target = (root / relative).resolve()
+        if root not in target.parents:
+            continue
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source, encoding="utf-8")
+        backup = target.with_name(target.name + ".bak")
+        shutil.copy2(target, backup)
+        backups[relative] = str(backup)
+
+    if not backups:
+        raise OSError("没有可备份的源文件。")
+    state["fix_backups"] = backups
+    state["fix_backup_scan_id"] = scan_id
+    return backups
+
+
+def _rollback_fix_files(scan_id: str) -> tuple[bool, str]:
+    """用 .bak 备份覆盖工作区当前文件，并清空修复结果。"""
+    state = st.session_state
+    backups = state.get("fix_backups") or {}
+    if not backups or state.get("fix_backup_scan_id") != scan_id:
+        return False, "没有可回滚的备份。"
+
+    root_value = state.get("fix_workspace_path")
+    if not root_value:
+        return False, "修复工作区不存在，无法回滚。"
+    root = Path(root_value)
+
+    restored = 0
+    for relative, backup_value in backups.items():
+        backup = Path(backup_value)
+        if not backup.exists():
+            continue
+        target = (root / relative).resolve()
+        if root not in target.parents:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(backup, target)
+        restored += 1
+
+    if restored == 0:
+        return False, "备份文件不存在，无法回滚。"
+    state["ai_fix_cache"] = {}
+    state["fix_rollback_notice"] = True
+    return True, ""
+
+
+def render_ai_fix(report: ScanReport, sources: dict[str, str], api_key: str) -> None:
     """在漏洞表格下方提供「一键 AI 修复」并展示修复前后对比。"""
     high_issues = [
         issue
@@ -517,11 +890,18 @@ def render_ai_fix(report: ScanReport, source: str, filename: str, api_key: str) 
     if not high_issues:
         return
 
+    scan_id = _sources_digest(sources)
+    _sync_fix_scan_state(scan_id)
+    state = st.session_state
+
     st.divider()
     st.subheader("🤖 AI 一键修复")
+    if state.pop("fix_rollback_notice", False):
+        st.success("已回滚，请重新扫描确认")
     st.caption(
-        f"检测到 **{len(high_issues)}** 个高危问题，可调用 DeepSeek 自动生成修复代码；"
-        "右侧修复结果可直接复制替换原片段。"
+        f"检测到 **{len(high_issues)}** 个高危问题，涉及 "
+        f"**{len({issue.file for issue in high_issues})}** 个文件，"
+        "可调用 DeepSeek 自动生成修复代码；右侧修复结果可直接复制替换原片段。"
     )
 
     if not api_key:
@@ -530,7 +910,7 @@ def render_ai_fix(report: ScanReport, source: str, filename: str, api_key: str) 
             "或设置环境变量 `DEEPSEEK_API_KEY`（也支持 `.streamlit/secrets.toml` 中的 `deepseek_api_key`）。"
         )
 
-    cache: dict[str, dict] = st.session_state.setdefault("ai_fix_cache", {})
+    cache: dict[str, dict] = state.setdefault("ai_fix_cache", {})
     clicked = st.button(
         "🔧 一键 AI 修复",
         type="primary",
@@ -540,34 +920,75 @@ def render_ai_fix(report: ScanReport, source: str, filename: str, api_key: str) 
     )
 
     if clicked:
-        errors = 0
-        progress = st.progress(0.0, text="正在调用 DeepSeek...")
-        for index, issue in enumerate(high_issues, start=1):
-            key = _fix_cache_key(source, issue.rule, issue.line)
-            if key in cache:
-                progress.progress(index / len(high_issues), text=f"已完成 {index}/{len(high_issues)}")
-                continue
-            start, end, snippet = extract_code_snippet(source, issue.line)
-            try:
-                fixed = call_deepseek(api_key, build_fix_prompt(filename, start, end, snippet, [issue]))
-                cache[key] = {"start": start, "end": end, "before": snippet, "after": fixed}
-            except Exception as exc:  # 单个问题失败不影响其他问题
-                errors += 1
-                cache[key] = {"start": start, "end": end, "before": snippet, "error": str(exc)}
-            progress.progress(index / len(high_issues), text=f"已完成 {index}/{len(high_issues)}")
-        progress.empty()
-        if errors:
-            st.error(f"有 {errors} 个问题修复失败，详情见下方。")
+        try:
+            _backup_fix_sources(sources, scan_id)
+        except Exception as exc:
+            st.error(f"备份原文件失败，已停止修复：{exc}")
         else:
-            st.success("AI 修复完成，请在下方对比并复制代码。")
+            errors = 0
+            progress = st.progress(0.0, text="正在调用 DeepSeek...")
+            for index, issue in enumerate(high_issues, start=1):
+                source = sources.get(issue.file, "")
+                key = _fix_cache_key(source, issue.rule, issue.line)
+                if key in cache:
+                    progress.progress(index / len(high_issues), text=f"已完成 {index}/{len(high_issues)}")
+                    continue
+                if not source:
+                    errors += 1
+                    cache[key] = {
+                        "start": 1,
+                        "end": 0,
+                        "before": "",
+                        "error": f"无法读取源码：{issue.file}",
+                    }
+                    progress.progress(index / len(high_issues), text=f"已完成 {index}/{len(high_issues)}")
+                    continue
+                start, end, snippet = extract_code_snippet(source, issue.line)
+                try:
+                    fixed = call_deepseek(
+                        api_key,
+                        build_fix_prompt(issue.file, start, end, snippet, [issue]),
+                    )
+                    cache[key] = {"start": start, "end": end, "before": snippet, "after": fixed}
+                except Exception as exc:  # 单个问题失败不影响其他问题
+                    errors += 1
+                    cache[key] = {"start": start, "end": end, "before": snippet, "error": str(exc)}
+                progress.progress(index / len(high_issues), text=f"已完成 {index}/{len(high_issues)}")
+            progress.empty()
+            if errors:
+                st.error(f"有 {errors} 个问题修复失败，详情见下方。")
+            else:
+                st.success("AI 修复完成，请在下方对比并复制代码。")
+
+    backups = state.get("fix_backups") or {}
+    if backups and state.get("fix_backup_scan_id") == scan_id:
+        st.caption(
+            f"已备份 **{len(backups)}** 个原文件为 `.bak`"
+            "（位于本次会话的服务器临时工作区，不会修改你本地的文件）。"
+        )
+        if st.button(
+            "⏪ 回滚到修复前",
+            key="rollback_ai_fix",
+            use_container_width=True,
+        ):
+            ok, message = _rollback_fix_files(scan_id)
+            if ok:
+                st.rerun()
+            else:
+                st.error(message)
 
     shown = 0
     for position, issue in enumerate(high_issues):
+        source = sources.get(issue.file, "")
         entry = cache.get(_fix_cache_key(source, issue.rule, issue.line))
         if entry is None:
             continue
         shown += 1
-        st.markdown(f"#### 第 {issue.line if issue.line > 0 else '文件级'} 行 · {issue.name}（{issue.rule}）")
+        st.markdown(
+            f"#### `{issue.file}` · "
+            f"第 {issue.line if issue.line > 0 else '文件级'} 行 · "
+            f"{issue.name}（{issue.rule}）"
+        )
         st.caption(f"{issue.message} · 修复建议：{issue.suggestion}")
         if "error" in entry:
             st.error(f"修复失败：{entry['error']}")
@@ -584,13 +1005,37 @@ def render_ai_fix(report: ScanReport, source: str, filename: str, api_key: str) 
         st.download_button(
             "⬇️ 下载修复后的代码片段",
             data=entry["after"],
-            file_name=f"{Path(filename).stem}_fixed_L{entry['start']}-{entry['end']}.py",
+            file_name=f"{Path(issue.file).stem}_fixed_L{entry['start']}-{entry['end']}.py",
             mime="text/x-python",
             key=f"download_fix_{position}_{issue.rule}_{issue.line}",
         )
 
     if shown == 0 and not clicked:
         st.caption("点击上方按钮开始修复。")
+
+
+def render_security_export(
+    report: ScanReport,
+    filename: str,
+    dependencies: DependencyReport | None = None,
+) -> None:
+    """在安全扫描页底部提供 Markdown 诊断报告下载。"""
+    generated = datetime.now()
+    stem = Path(filename).stem.replace(" ", "_") or "scan"
+    st.caption("报告包含综合得分、风险等级、问题清单、依赖校验和修复建议。")
+    st.download_button(
+        "📥 导出诊断报告",
+        data=render_scan_markdown(
+            report,
+            generated_at=generated,
+            target=filename,
+            dependencies=dependencies,
+        ),
+        file_name=f"security_report_{stem}_{generated:%Y%m%d_%H%M%S}.md",
+        mime="text/markdown",
+        use_container_width=True,
+        key="download_security_report",
+    )
 
 
 def _format_size(size_bytes: int) -> str:
@@ -827,6 +1272,21 @@ def render_context_debt(report: ContextHealthReport) -> None:
     )
 
 
+def render_context_export(report: ContextHealthReport) -> None:
+    """在上下文健康检查页底部提供 Markdown 诊断报告下载。"""
+    generated = datetime.now()
+    stem = Path(report.target).name.replace(" ", "_") or "context"
+    st.caption("报告包含文件体积、超限预警和 TODO / FIXME 明细。")
+    st.download_button(
+        "📥 导出诊断报告",
+        data=render_context_markdown(report, generated_at=generated),
+        file_name=f"context_health_report_{stem}_{generated:%Y%m%d_%H%M%S}.md",
+        mime="text/markdown",
+        use_container_width=True,
+        key="download_context_report",
+    )
+
+
 def render_context_page() -> None:
     """渲染上下文健康检查页面。"""
     with st.form("context_health_form"):
@@ -881,43 +1341,62 @@ def render_context_page() -> None:
     st.divider()
     render_context_debt(report)
     st.caption("⚠️ 上下文健康建议仅供参考，请结合项目实际情况决定是否拆分文件。")
+    st.divider()
+    render_context_export(report)
 
 
 def render_scan_page(api_key: str) -> None:
     """渲染安全扫描与修复页面（原有功能）。"""
     uploaded = st.file_uploader(
-        "上传需要预检的 Python 文件（仅支持 .py）",
-        type=["py"],
+        "上传需要预检的 Python 文件或 .zip 压缩包",
+        type=["py", "zip"],
         accept_multiple_files=False,
+        help=(
+            "支持单个 .py 文件，或包含多个 .py 文件的 .zip 压缩包；"
+            "压缩包会安全解压到临时目录后汇总扫描。"
+        ),
     )
 
     if uploaded is None:
-        st.info("请上传一个 .py 文件开始扫描。")
-        st.caption("提示：本工具只做静态分析，不会执行上传的代码。")
+        st.info("请上传一个 .py 文件或 .zip 压缩包开始扫描。")
+        st.caption(
+            "提示：本工具只做静态分析，不会执行上传的代码；"
+            "压缩包内只提取 .py 文件。"
+        )
         return
 
     filename = Path(uploaded.name).name or "uploaded.py"
     content = uploaded.getvalue()
-    source = content.decode("utf-8", errors="replace")
     with st.spinner("正在扫描，请稍候..."):
         try:
-            report = scan_uploaded_file(filename, content)
+            bundle = scan_uploaded_file(filename, content)
         except Exception as exc:  # 页面不应因单次扫描异常而崩溃
             st.error(f"扫描失败：{exc}")
             return
 
-    st.caption(
-        f"已扫描 **{filename}** · "
-        f"{report.files[0].line_count if report.files else 0} 行 · "
-        f"耗时 {report.elapsed:.3f}s"
-    )
+    report = bundle.report
+    total_lines = sum(item.line_count for item in report.files)
+    if bundle.is_archive:
+        st.caption(
+            f"已扫描压缩包 **{filename}** · {len(report.files)} 个 .py 文件 · "
+            f"{total_lines:,} 行 · 耗时 {report.elapsed:.3f}s"
+        )
+    else:
+        st.caption(
+            f"已扫描 **{filename}** · {total_lines} 行 · "
+            f"耗时 {report.elapsed:.3f}s"
+        )
+    render_merge_block_banner(report)
     render_summary(report)
     st.divider()
     render_severity_chart(report)
     st.divider()
     render_issues(report)
-    render_ai_fix(report, source, filename, api_key)
+    dependency_report = render_dependency_check(bundle.sources)
+    render_ai_fix(report, bundle.sources, api_key)
     st.caption("⚠️ 预检结果与 AI 修复建议仅供参考，请结合人工复核后再合并代码。")
+    st.divider()
+    render_security_export(report, filename, dependency_report)
 
 
 def main() -> None:

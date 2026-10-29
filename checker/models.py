@@ -33,6 +33,50 @@ class Severity(str, Enum):
             raise ValueError(f"未知的严重级别: {value}") from exc
 
 
+class ReviewPriority(str, Enum):
+    """人工审查优先级：P0 阻断合并，P1 优先审查，P2 常规审查。"""
+
+    P0 = "P0"
+    P1 = "P1"
+    P2 = "P2"
+
+    @property
+    def rank(self) -> int:
+        """排序权重，数值越小越紧急。"""
+        return {"P0": 0, "P1": 1, "P2": 2}[self.value]
+
+    @property
+    def label(self) -> str:
+        """供报告展示的中文标签。"""
+        return {
+            "P0": "P0 阻断合并",
+            "P1": "P1 优先审查",
+            "P2": "P2 常规审查",
+        }[self.value]
+
+
+_P0_RULES = frozenset({"PE011"})
+_P1_RULES = frozenset({"PE017"})
+_P2_RULES = frozenset({"PE003", "PE004"})
+
+
+def review_priority_for(rule: str, severity: Severity) -> ReviewPriority:
+    """根据规则类型和严重程度给出审查优先级。
+
+    规则类型优先于通用严重程度：硬编码密钥为 P0，未捕获外部调用为 P1，
+    缺少文档字符串为 P2；其余问题中高危为 P1，其余为 P2。
+    """
+    if rule in _P0_RULES:
+        return ReviewPriority.P0
+    if rule in _P1_RULES:
+        return ReviewPriority.P1
+    if rule in _P2_RULES:
+        return ReviewPriority.P2
+    if severity is Severity.HIGH:
+        return ReviewPriority.P1
+    return ReviewPriority.P2
+
+
 @dataclass(frozen=True)
 class Issue:
     """单条检查结论。"""
@@ -45,6 +89,15 @@ class Issue:
     line: int
     evidence: str = ""
     suggestion: str = ""
+    priority: ReviewPriority = field(init=False)
+
+    def __post_init__(self) -> None:
+        """根据规则与严重程度自动计算审查优先级。"""
+        object.__setattr__(
+            self,
+            "priority",
+            review_priority_for(self.rule, self.severity),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """转换为可 JSON 序列化的字典。"""
@@ -52,6 +105,7 @@ class Issue:
             "rule": self.rule,
             "name": self.name,
             "severity": self.severity.value,
+            "priority": self.priority.value,
             "message": self.message,
             "file": self.file,
             "line": self.line,

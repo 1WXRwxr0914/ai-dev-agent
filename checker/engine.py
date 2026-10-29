@@ -32,10 +32,22 @@ DEFAULT_EXCLUDED_DIRS = frozenset(
 class CheckEngine:
     """按规则集扫描 Python 文件并生成报告。"""
 
-    def __init__(self, rules: list[Rule] | None = None, exclude: list[str] | None = None):
-        """初始化引擎；exclude 支持目录名、文件名或相对路径通配符。"""
+    def __init__(
+        self,
+        rules: list[Rule] | None = None,
+        exclude: list[str] | None = None,
+        display_root: str | Path | None = None,
+    ):
+        """初始化引擎；exclude 支持目录名、文件名或相对路径通配符。
+
+        display_root 用于把扫描结果中的文件路径显示为相对于该目录的形式，
+        适合扫描临时解压目录时隐藏服务器上的真实路径。
+        """
         self.rules = list(RULES if rules is None else rules)
         self.exclude = list(exclude or [])
+        self.display_root = (
+            Path(display_root).expanduser().resolve() if display_root is not None else None
+        )
 
     def run(self, target: str | Path) -> ScanReport:
         """扫描目标文件或目录，返回汇总报告。"""
@@ -142,7 +154,14 @@ class CheckEngine:
                         suggestion=finding.suggestion,
                     )
                 )
-        issues.sort(key=lambda issue: (-issue.severity.weight, issue.line, issue.rule))
+        issues.sort(
+            key=lambda issue: (
+                issue.priority.rank,
+                -issue.severity.weight,
+                issue.line,
+                issue.rule,
+            )
+        )
         return FileReport(
             path=display,
             issues=issues,
@@ -150,9 +169,13 @@ class CheckEngine:
             elapsed=time.perf_counter() - started,
         )
 
-    @staticmethod
-    def _display_path(path: Path) -> str:
-        """优先输出相对于当前工作目录的路径，便于阅读。"""
+    def _display_path(self, path: Path) -> str:
+        """优先输出相对于 display_root 或当前工作目录的路径，便于阅读。"""
+        if self.display_root is not None:
+            try:
+                return path.resolve().relative_to(self.display_root).as_posix()
+            except ValueError:
+                pass
         try:
             return path.resolve().relative_to(Path.cwd()).as_posix()
         except ValueError:

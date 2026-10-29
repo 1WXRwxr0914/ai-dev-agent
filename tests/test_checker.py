@@ -7,7 +7,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from checker import CheckEngine, Severity
+from checker import (
+    CheckEngine,
+    ReviewPriority,
+    Severity,
+    review_priority_for,
+)
 from checker.models import ScanReport
 
 
@@ -101,11 +106,76 @@ class CheckerTestCase(unittest.TestCase):
         payload = json.loads(json.dumps(report.to_dict(), ensure_ascii=False))
         self.assertEqual(payload["file_count"], 1)
         self.assertEqual(payload["files"][0]["issues"][0]["severity"], "high")
+        self.assertEqual(payload["files"][0]["issues"][0]["priority"], "P0")
+
+    def test_review_priority_mapping(self) -> None:
+        self.assertIs(
+            review_priority_for("PE011", Severity.HIGH), ReviewPriority.P0
+        )
+        self.assertIs(
+            review_priority_for("PE017", Severity.MEDIUM), ReviewPriority.P1
+        )
+        self.assertIs(
+            review_priority_for("PE003", Severity.LOW), ReviewPriority.P2
+        )
+        self.assertIs(
+            review_priority_for("PE004", Severity.LOW), ReviewPriority.P2
+        )
+        self.assertIs(
+            review_priority_for("PE013", Severity.HIGH), ReviewPriority.P1
+        )
+        self.assertIs(
+            review_priority_for("PE001", Severity.LOW), ReviewPriority.P2
+        )
+
+    def test_detects_uncaught_external_call(self) -> None:
+        source = (
+            '"""测试模块。"""\n\n'
+            "import requests\n\n\n"
+            "def fetch():\n"
+            '    """拉取数据。"""\n'
+            '    return requests.get("https://example.com")\n'
+        )
+        report = self.scan_source(source)
+
+        self.assertIn("PE017", self.rule_codes(report))
+        issue = next(
+            issue
+            for file_report in report.files
+            for issue in file_report.issues
+            if issue.rule == "PE017"
+        )
+        self.assertIs(issue.priority, ReviewPriority.P1)
+
+    def test_caught_external_call_is_not_reported(self) -> None:
+        source = (
+            '"""测试模块。"""\n\n'
+            "import requests\n\n\n"
+            "def fetch():\n"
+            '    """拉取数据。"""\n'
+            "    try:\n"
+            '        return requests.get("https://example.com")\n'
+            "    except requests.RequestException:\n"
+            "        return None\n"
+        )
+        report = self.scan_source(source)
+
+        self.assertNotIn("PE017", self.rule_codes(report))
+
+    def test_display_root_reports_relative_paths(self) -> None:
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "mod.py").write_text(
+            '"""模块。"""\n\nVALUE = 1\n', encoding="utf-8"
+        )
+
+        report = CheckEngine(display_root=self.root).run(self.root)
+
+        self.assertEqual([item.path for item in report.files], ["pkg/mod.py"])
 
     def test_scan_sample_code_directory(self) -> None:
         sample_dir = Path(__file__).resolve().parents[1] / "sample_code"
         report = CheckEngine().run(sample_dir)
-        self.assertEqual(len(report.files), 4)
+        self.assertEqual(len(report.files), 5)
         self.assertGreater(report.total_issues, 0)
         self.assertLess(report.score, 100)
         codes = self.rule_codes(report)
