@@ -5,8 +5,10 @@ from __future__ import annotations
 import ast
 import fnmatch
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
+from .custom_rules import build_custom_rule
 from .models import FileReport, Issue, ScanReport, Severity
 from .rules import RULES, Rule, RuleContext
 
@@ -37,17 +39,23 @@ class CheckEngine:
         rules: list[Rule] | None = None,
         exclude: list[str] | None = None,
         display_root: str | Path | None = None,
+        custom_terms: Iterable[str] | str | None = None,
     ):
         """初始化引擎；exclude 支持目录名、文件名或相对路径通配符。
 
         display_root 用于把扫描结果中的文件路径显示为相对于该目录的形式，
-        适合扫描临时解压目录时隐藏服务器上的真实路径。
+        适合扫描临时解压目录时隐藏服务器上的真实路径。custom_terms 会额外
+        注册一条「【自定义】违规」规则。
         """
         self.rules = list(RULES if rules is None else rules)
         self.exclude = list(exclude or [])
         self.display_root = (
             Path(display_root).expanduser().resolve() if display_root is not None else None
         )
+        if custom_terms:
+            custom_rule = build_custom_rule(custom_terms)
+            if custom_rule is not None:
+                self.rules.append(custom_rule)
 
     def run(self, target: str | Path) -> ScanReport:
         """扫描目标文件或目录，返回汇总报告。"""

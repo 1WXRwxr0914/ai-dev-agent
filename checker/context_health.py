@@ -141,7 +141,7 @@ def resolve_target(raw: str, allowed_root: Path) -> Path:
     return resolved
 
 
-def _iter_py_files(root: Path) -> list[Path]:
+def iter_python_files(root: Path) -> list[Path]:
     """递归收集 .py 文件，跳过缓存/依赖目录与符号链接。"""
     found: list[Path] = []
     for path in root.rglob("*.py"):
@@ -212,7 +212,7 @@ def scan_context_health(target: str | Path) -> ContextHealthReport:
         target_display = root.as_posix()
 
     files: list[FileHealth] = []
-    for path in _iter_py_files(root):
+    for path in iter_python_files(root):
         display = path.relative_to(root).as_posix()
         try:
             size_bytes = path.stat().st_size

@@ -175,7 +175,7 @@ class CheckerTestCase(unittest.TestCase):
     def test_scan_sample_code_directory(self) -> None:
         sample_dir = Path(__file__).resolve().parents[1] / "sample_code"
         report = CheckEngine().run(sample_dir)
-        self.assertEqual(len(report.files), 5)
+        self.assertEqual(len(report.files), 7)
         self.assertGreater(report.total_issues, 0)
         self.assertLess(report.score, 100)
         codes = self.rule_codes(report)

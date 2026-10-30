@@ -35,13 +35,32 @@ from checker import (
     render_context_markdown,
     render_scan_markdown,
 )
+from checker.adversarial import (
+    BLUE_SYSTEM_PROMPT,
+    MAX_ROUNDS,
+    RED_SYSTEM_PROMPT,
+    build_blue_prompt,
+    build_red_prompt,
+    extract_python_code,
+    is_defense_success,
+)
 from checker.archive import extract_python_files
+from checker.custom_rules import parse_custom_terms
 from checker.dependencies import (
     DependencyReport,
     ImportReference,
     PackageStatus,
     extract_imports,
     verify_dependencies,
+)
+from checker.dependency_graph import (
+    build_dependency_figure,
+    build_project_dependency_graph,
+)
+from checker.review import (
+    REVIEW_INSTRUCTION,
+    REVIEW_SYSTEM_PROMPT,
+    build_review_payload,
 )
 from checker.context_health import (
     LINE_THRESHOLD,
@@ -190,7 +209,11 @@ class UploadedScan:
     is_archive: bool = False
 
 
-def scan_uploaded_file(filename: str, content: bytes) -> UploadedScan:
+def scan_uploaded_file(
+    filename: str,
+    content: bytes,
+    custom_terms: list[str] | None = None,
+) -> UploadedScan:
     """扫描上传的单个 .py 文件或 .zip 压缩包，返回汇总报告与源码映射。"""
     safe_name = Path(filename).name or "uploaded.py"
     suffix = Path(safe_name).suffix.lower()
@@ -202,7 +225,9 @@ def scan_uploaded_file(filename: str, content: bytes) -> UploadedScan:
 
         if suffix == ".zip":
             paths = extract_python_files(content, root)
-            report = CheckEngine(display_root=root).run(root)
+            report = CheckEngine(
+                display_root=root, custom_terms=custom_terms
+            ).run(root)
             if not report.files:
                 raise ValueError(
                     "压缩包内没有可扫描的 .py 文件（可能都位于被排除的目录中）。"
@@ -217,7 +242,9 @@ def scan_uploaded_file(filename: str, content: bytes) -> UploadedScan:
 
         path = root / safe_name
         path.write_bytes(content)
-        report = CheckEngine(display_root=root).run(path)
+        report = CheckEngine(
+            display_root=root, custom_terms=custom_terms
+        ).run(path)
         return UploadedScan(
             report,
             {safe_name: content.decode("utf-8", errors="replace")},
@@ -628,6 +655,8 @@ def render_account_panel() -> None:
             _cleanup_fix_workspace()
             st.session_state.pop("ai_fix_scan_id", None)
             st.session_state["ai_fix_cache"] = {}
+            st.session_state["red_blue_cache"] = {}
+            st.session_state.pop("code_review_guide", None)
             st.session_state.pop("authenticated", None)
             st.session_state.pop("login_user", None)
             st.session_state.pop("active_page", None)
@@ -708,8 +737,14 @@ def strip_code_fence(text: str) -> str:
     return "\n".join(lines).strip("\n")
 
 
-def call_deepseek(api_key: str, prompt: str) -> str:
-    """调用 DeepSeek 对话接口，返回修复后的代码。"""
+def call_deepseek(
+    api_key: str,
+    prompt: str,
+    system_prompt: str = SYSTEM_PROMPT,
+    temperature: float = 0.2,
+    strip_fences: bool = True,
+) -> str:
+    """调用 DeepSeek 对话接口，返回修复代码、审查指南或对抗日志。"""
     model = st.session_state.get("deepseek_model", DEEPSEEK_MODEL)
     response = requests.post(
         DEEPSEEK_API_URL,
@@ -720,10 +755,10 @@ def call_deepseek(api_key: str, prompt: str) -> str:
         json={
             "model": model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.2,
+            "temperature": temperature,
             "stream": False,
         },
         timeout=DEEPSEEK_TIMEOUT,
@@ -734,16 +769,16 @@ def call_deepseek(api_key: str, prompt: str) -> str:
         content = response.json()["choices"][0]["message"]["content"]
     except (KeyError, IndexError, ValueError) as exc:
         raise RuntimeError(f"无法解析 DeepSeek 响应：{response.text[:200]}") from exc
-    fixed = strip_code_fence(content)
-    if not fixed.strip():
+    text = strip_code_fence(content) if strip_fences else content.strip()
+    if not text.strip():
         raise RuntimeError("DeepSeek 返回了空内容")
-    return fixed
+    return text
 
 
-def _fix_cache_key(source: str, rule: str, line: int) -> str:
-    """用文件内容哈希 + 规则 + 行号作为修复结果缓存键。"""
+def _fix_cache_key(source: str, rule: str, line: int, file: str = "") -> str:
+    """用文件内容哈希 + 文件 + 规则 + 行号作为修复结果缓存键。"""
     digest = hashlib.sha1(source.encode("utf-8", errors="replace")).hexdigest()[:12]
-    return f"{digest}:{rule}:{line}"
+    return f"{digest}:{file}:{rule}:{line}"
 
 
 def _sources_digest(sources: dict[str, str]) -> str:
@@ -781,6 +816,7 @@ def _sync_fix_scan_state(scan_id: str) -> None:
     _cleanup_fix_workspace()
     state["ai_fix_scan_id"] = scan_id
     state["ai_fix_cache"] = {}
+    state["red_blue_cache"] = {}
 
 
 def _ensure_fix_workspace(sources: dict[str, str], scan_id: str) -> Path:
@@ -875,12 +911,168 @@ def _rollback_fix_files(scan_id: str) -> tuple[bool, str]:
     if restored == 0:
         return False, "备份文件不存在，无法回滚。"
     state["ai_fix_cache"] = {}
+    state["red_blue_cache"] = {}
     state["fix_rollback_notice"] = True
     return True, ""
 
 
-def render_ai_fix(report: ScanReport, sources: dict[str, str], api_key: str) -> None:
-    """在漏洞表格下方提供「一键 AI 修复」并展示修复前后对比。"""
+def _render_issue_heading(issue) -> None:
+    """渲染单个高危问题的标题和说明。"""
+    st.markdown(
+        f"#### `{issue.file}` · "
+        f"第 {issue.line if issue.line > 0 else '文件级'} 行 · "
+        f"{issue.name}（{issue.rule}）"
+    )
+    st.caption(f"{issue.message} · 修复建议：{issue.suggestion}")
+
+
+def _render_battle_event(event: dict) -> None:
+    """渲染一条红蓝对抗日志。"""
+    role = event.get("role")
+    content = event.get("content", "")
+    if role == "red":
+        with st.chat_message("红方攻击", avatar="🔴"):
+            st.markdown(content)
+    elif role == "blue":
+        with st.chat_message("蓝方防御", avatar="🛡️"):
+            st.markdown(content)
+    else:
+        st.warning(content)
+
+
+def _render_battle_log(entry: dict) -> None:
+    """从缓存中重放完整的对战日志。"""
+    for event in entry.get("events", []):
+        _render_battle_event(event)
+
+
+def _run_red_blue_issue(issue, source: str, api_key: str) -> dict:
+    """对单个高危问题执行最多 MAX_ROUNDS 轮红蓝对抗。"""
+    start, end, snippet = extract_code_snippet(source, issue.line)
+    entry: dict = {
+        "start": start,
+        "end": end,
+        "before": snippet,
+        "fixed": snippet,
+        "events": [],
+        "status": "max_rounds",
+        "rounds": 0,
+        "verified_round": None,
+        "error": "",
+    }
+    if not source:
+        entry["status"] = "error"
+        entry["error"] = f"无法读取源码：{issue.file}"
+        error_event = {"role": "system", "content": entry["error"]}
+        entry["events"].append(error_event)
+        _render_battle_event(error_event)
+        return entry
+
+    current_code = snippet
+    for round_no in range(1, MAX_ROUNDS + 1):
+        entry["rounds"] = round_no
+
+        try:
+            red = call_deepseek(
+                api_key,
+                build_red_prompt(current_code),
+                system_prompt=RED_SYSTEM_PROMPT,
+                temperature=0.4,
+                strip_fences=False,
+            )
+        except Exception as exc:
+            entry["status"] = "error"
+            entry["error"] = f"红方调用失败：{exc}"
+            error_event = {"role": "system", "content": entry["error"]}
+            entry["events"].append(error_event)
+            _render_battle_event(error_event)
+            break
+
+        red_event = {"role": "red", "round": round_no, "content": red}
+        entry["events"].append(red_event)
+        _render_battle_event(red_event)
+
+        if round_no > 1 and is_defense_success(red):
+            entry["status"] = "defended"
+            entry["verified_round"] = round_no
+            break
+
+        try:
+            blue = call_deepseek(
+                api_key,
+                build_blue_prompt(current_code, red),
+                system_prompt=BLUE_SYSTEM_PROMPT,
+                temperature=0.2,
+                strip_fences=False,
+            )
+        except Exception as exc:
+            entry["status"] = "error"
+            entry["error"] = f"蓝方调用失败：{exc}"
+            error_event = {"role": "system", "content": entry["error"]}
+            entry["events"].append(error_event)
+            _render_battle_event(error_event)
+            break
+
+        blue_event = {"role": "blue", "round": round_no, "content": blue}
+        entry["events"].append(blue_event)
+        _render_battle_event(blue_event)
+
+        fixed = extract_python_code(blue)
+        if not fixed.strip():
+            entry["status"] = "blue_failed"
+            entry["error"] = "蓝方未返回可用的修复代码"
+            error_event = {"role": "system", "content": entry["error"]}
+            entry["events"].append(error_event)
+            _render_battle_event(error_event)
+            break
+        current_code = fixed
+
+    entry["fixed"] = current_code
+    return entry
+
+
+def _render_red_blue_result(issue, entry: dict, position: int) -> None:
+    """渲染单个问题的最终状态和修复代码。"""
+    status = entry.get("status")
+    if status == "defended":
+        st.success(
+            f"✅ 防守成功：红方在第 {entry.get('verified_round')} 轮表示无法攻破。"
+        )
+    elif status == "max_rounds":
+        st.warning(
+            f"⚠️ 已达到 {MAX_ROUNDS} 轮上限，最后一轮修复尚未被红方验证，"
+            "建议人工复核。"
+        )
+    elif status == "blue_failed":
+        st.error(f"❌ 蓝方修复失败：{entry.get('error', '未返回可用代码')}")
+    else:
+        st.error(f"❌ 红蓝对抗失败：{entry.get('error', '未知错误')}")
+
+    if entry.get("before"):
+        with st.expander("查看被修复的原始代码"):
+            st.code(entry["before"], language="python", line_numbers=True)
+
+    if status in {"defended", "max_rounds"}:
+        st.markdown("**🛡️ 最终修复代码**")
+        st.code(entry["fixed"], language="python", line_numbers=True)
+        st.download_button(
+            "⬇️ 下载最终修复代码",
+            data=entry["fixed"],
+            file_name=(
+                f"{Path(issue.file).stem}_redblue_"
+                f"L{entry['start']}-{entry['end']}.py"
+            ),
+            mime="text/x-python",
+            key=f"download_redblue_{position}_{issue.rule}_{issue.line}",
+        )
+
+
+def render_red_blue_fix(
+    report: ScanReport,
+    sources: dict[str, str],
+    api_key: str,
+) -> None:
+    """对高危问题执行红蓝对抗修复并展示实时对战日志。"""
     high_issues = [
         issue
         for file_report in report.files
@@ -895,13 +1087,16 @@ def render_ai_fix(report: ScanReport, sources: dict[str, str], api_key: str) -> 
     state = st.session_state
 
     st.divider()
-    st.subheader("🤖 AI 一键修复")
+    st.subheader("🔥 红蓝对抗修复")
     if state.pop("fix_rollback_notice", False):
         st.success("已回滚，请重新扫描确认")
     st.caption(
         f"检测到 **{len(high_issues)}** 个高危问题，涉及 "
-        f"**{len({issue.file for issue in high_issues})}** 个文件，"
-        "可调用 DeepSeek 自动生成修复代码；右侧修复结果可直接复制替换原片段。"
+        f"**{len({issue.file for issue in high_issues})}** 个文件。"
+        f"每个问题最多进行 **{MAX_ROUNDS}** 轮红蓝对抗，每轮会调用两次 DeepSeek。"
+    )
+    st.caption(
+        "🔴 红方输出仅用于授权的防御性验证，请勿在任何真实系统上执行。"
     )
 
     if not api_key:
@@ -910,55 +1105,22 @@ def render_ai_fix(report: ScanReport, sources: dict[str, str], api_key: str) -> 
             "或设置环境变量 `DEEPSEEK_API_KEY`（也支持 `.streamlit/secrets.toml` 中的 `deepseek_api_key`）。"
         )
 
-    cache: dict[str, dict] = state.setdefault("ai_fix_cache", {})
+    cache: dict[str, dict] = state.setdefault("red_blue_cache", {})
     clicked = st.button(
-        "🔧 一键 AI 修复",
+        "🔥 开启红蓝对抗修复",
         type="primary",
         use_container_width=True,
         disabled=not api_key,
-        help="逐个提取高危代码片段，调用 DeepSeek 生成修复版本。",
+        help="红方尝试构造攻击，蓝方修复，再由红方验证；最多 3 轮。",
     )
 
+    backup_ok = False
     if clicked:
         try:
             _backup_fix_sources(sources, scan_id)
+            backup_ok = True
         except Exception as exc:
             st.error(f"备份原文件失败，已停止修复：{exc}")
-        else:
-            errors = 0
-            progress = st.progress(0.0, text="正在调用 DeepSeek...")
-            for index, issue in enumerate(high_issues, start=1):
-                source = sources.get(issue.file, "")
-                key = _fix_cache_key(source, issue.rule, issue.line)
-                if key in cache:
-                    progress.progress(index / len(high_issues), text=f"已完成 {index}/{len(high_issues)}")
-                    continue
-                if not source:
-                    errors += 1
-                    cache[key] = {
-                        "start": 1,
-                        "end": 0,
-                        "before": "",
-                        "error": f"无法读取源码：{issue.file}",
-                    }
-                    progress.progress(index / len(high_issues), text=f"已完成 {index}/{len(high_issues)}")
-                    continue
-                start, end, snippet = extract_code_snippet(source, issue.line)
-                try:
-                    fixed = call_deepseek(
-                        api_key,
-                        build_fix_prompt(issue.file, start, end, snippet, [issue]),
-                    )
-                    cache[key] = {"start": start, "end": end, "before": snippet, "after": fixed}
-                except Exception as exc:  # 单个问题失败不影响其他问题
-                    errors += 1
-                    cache[key] = {"start": start, "end": end, "before": snippet, "error": str(exc)}
-                progress.progress(index / len(high_issues), text=f"已完成 {index}/{len(high_issues)}")
-            progress.empty()
-            if errors:
-                st.error(f"有 {errors} 个问题修复失败，详情见下方。")
-            else:
-                st.success("AI 修复完成，请在下方对比并复制代码。")
 
     backups = state.get("fix_backups") or {}
     if backups and state.get("fix_backup_scan_id") == scan_id:
@@ -977,41 +1139,142 @@ def render_ai_fix(report: ScanReport, sources: dict[str, str], api_key: str) -> 
             else:
                 st.error(message)
 
+    rendered_live: set[str] = set()
+    if clicked and backup_ok and api_key:
+        errors = 0
+        unverified = 0
+        progress = st.progress(0.0, text="红蓝对抗进行中...")
+        for index, issue in enumerate(high_issues, start=1):
+            source = sources.get(issue.file, "")
+            key = _fix_cache_key(
+                source, issue.rule, issue.line, issue.file
+            )
+            if key in cache:
+                progress.progress(
+                    index / len(high_issues),
+                    text=f"已完成 {index}/{len(high_issues)}（已有结果）",
+                )
+                continue
+            _render_issue_heading(issue)
+            entry = _run_red_blue_issue(issue, source, api_key)
+            cache[key] = entry
+            _render_red_blue_result(issue, entry, index - 1)
+            rendered_live.add(key)
+            if entry.get("status") in {"error", "blue_failed"}:
+                errors += 1
+            elif entry.get("status") == "max_rounds":
+                unverified += 1
+            progress.progress(
+                index / len(high_issues),
+                text=f"已完成 {index}/{len(high_issues)}",
+            )
+        progress.empty()
+        if errors:
+            st.warning(f"有 {errors} 个问题对抗失败，详见上方对战日志。")
+        elif unverified:
+            st.warning("部分问题达到最大轮次，建议人工复核最终修复代码。")
+        else:
+            st.success("红蓝对抗修复完成，请查看对战日志和最终代码。")
+
     shown = 0
     for position, issue in enumerate(high_issues):
         source = sources.get(issue.file, "")
-        entry = cache.get(_fix_cache_key(source, issue.rule, issue.line))
-        if entry is None:
+        key = _fix_cache_key(
+            source, issue.rule, issue.line, issue.file
+        )
+        entry = cache.get(key)
+        if entry is None or key in rendered_live:
             continue
         shown += 1
-        st.markdown(
-            f"#### `{issue.file}` · "
-            f"第 {issue.line if issue.line > 0 else '文件级'} 行 · "
-            f"{issue.name}（{issue.rule}）"
-        )
-        st.caption(f"{issue.message} · 修复建议：{issue.suggestion}")
-        if "error" in entry:
-            st.error(f"修复失败：{entry['error']}")
-            continue
-
-        before_col, after_col = st.columns(2)
-        with before_col:
-            st.markdown("**❌ 修复前**")
-            st.code(entry["before"], language="python", line_numbers=True)
-        with after_col:
-            st.markdown("**✅ 修复后（点击右上角复制）**")
-            st.code(entry["after"], language="python", line_numbers=True)
-
-        st.download_button(
-            "⬇️ 下载修复后的代码片段",
-            data=entry["after"],
-            file_name=f"{Path(issue.file).stem}_fixed_L{entry['start']}-{entry['end']}.py",
-            mime="text/x-python",
-            key=f"download_fix_{position}_{issue.rule}_{issue.line}",
-        )
+        _render_issue_heading(issue)
+        _render_battle_log(entry)
+        _render_red_blue_result(issue, entry, position)
 
     if shown == 0 and not clicked:
-        st.caption("点击上方按钮开始修复。")
+        st.caption("点击上方按钮开始红蓝对抗修复。")
+
+
+def render_code_review_guide(
+    report: ScanReport,
+    sources: dict[str, str],
+    filename: str,
+    api_key: str,
+) -> None:
+    """在报告底部生成并展示团队 Code Review 指南。"""
+    scan_id = _sources_digest(sources)
+    state = st.session_state.get("code_review_guide")
+    if state and state.get("scan_id") != scan_id:
+        st.session_state.pop("code_review_guide", None)
+
+    st.divider()
+    st.subheader("🧭 Code Review 指南")
+    st.caption(
+        "让 DeepSeek 从资深架构师视角生成核心功能总结、建议审查顺序和人工核对风险点。"
+    )
+
+    if not api_key:
+        st.warning(
+            "生成 Code Review 指南需要 DeepSeek API Key，请在左侧侧边栏配置。"
+        )
+
+    clicked = st.button(
+        "生成 Code Review 指南",
+        type="primary",
+        use_container_width=True,
+        disabled=not api_key,
+        key="generate_code_review_guide",
+    )
+
+    if clicked:
+        payload, truncated = build_review_payload(
+            sources,
+            [file_report.path for file_report in report.files],
+        )
+        if not payload:
+            st.error("没有可提交给模型的代码。")
+        else:
+            prompt = f"{REVIEW_INSTRUCTION}\n\n代码如下：\n\n{payload}"
+            with st.spinner("正在生成 Code Review 指南..."):
+                try:
+                    guide = call_deepseek(
+                        api_key,
+                        prompt,
+                        system_prompt=REVIEW_SYSTEM_PROMPT,
+                        temperature=0.3,
+                    )
+                except Exception as exc:
+                    st.error(f"生成 Code Review 指南失败：{exc}")
+                else:
+                    st.session_state["code_review_guide"] = {
+                        "scan_id": scan_id,
+                        "text": guide,
+                        "truncated": truncated,
+                        "generated_at": datetime.now(),
+                        "model": st.session_state.get(
+                            "deepseek_model", DEEPSEEK_MODEL
+                        ),
+                    }
+
+    guide_state = st.session_state.get("code_review_guide")
+    if guide_state and guide_state.get("scan_id") == scan_id:
+        if guide_state.get("truncated"):
+            st.caption("代码超过长度上限，已截断后提交给模型。")
+        with st.container(border=True):
+            st.markdown(guide_state["text"])
+        generated = guide_state["generated_at"]
+        stem = Path(filename).stem or "scan"
+        st.download_button(
+            "⬇️ 下载 Code Review 指南",
+            data=guide_state["text"],
+            file_name=f"code_review_guide_{stem}_{generated:%Y%m%d_%H%M%S}.md",
+            mime="text/markdown",
+            key="download_code_review_guide",
+        )
+        st.caption(
+            f"生成时间：{generated:%Y-%m-%d %H:%M:%S} · "
+            f"模型：{guide_state.get('model', DEEPSEEK_MODEL)} · "
+            "AI 生成内容，请结合人工审查。"
+        )
 
 
 def render_security_export(
@@ -1227,6 +1490,41 @@ def render_file_line_chart(report: ContextHealthReport) -> None:
     )
 
 
+def render_project_dependency_graph(target: Path) -> None:
+    """展示项目内 .py 文件之间的 import 依赖网络图。"""
+    st.subheader("🕸️ 项目依赖关系图谱")
+    with st.spinner("正在分析文件之间的 import 关系..."):
+        try:
+            graph_data = build_project_dependency_graph(target)
+        except (OSError, ValueError) as exc:
+            st.warning(f"依赖关系分析失败：{exc}")
+            return
+
+    if not graph_data.nodes:
+        st.info("没有可分析的 .py 文件。")
+        return
+    if not graph_data.has_edges:
+        st.info(
+            "当前目录的 .py 文件之间没有 import 引用关系，"
+            "图谱仅展示全部文件节点。"
+        )
+
+    st.plotly_chart(
+        build_dependency_figure(graph_data),
+        width="stretch",
+        theme=None,
+        config={"displayModeBar": False},
+    )
+    if graph_data.core_nodes:
+        names = "、".join(graph_data.core_nodes)
+        st.caption(
+            f"红色放大节点为被引用最多的核心文件：{names}。"
+            "箭头方向表示 A → B（A 引用 B）。"
+        )
+    else:
+        st.caption("箭头方向表示 A → B（A 引用 B）；当前没有文件间的核心引用节点。")
+
+
 def render_oversize_warnings(report: ContextHealthReport) -> None:
     """对超过行数阈值的文件逐条给出红色预警。"""
     st.subheader("🚨 上下文污染预警")
@@ -1335,6 +1633,8 @@ def render_context_page() -> None:
     st.divider()
     render_file_line_chart(report)
     st.divider()
+    render_project_dependency_graph(target)
+    st.divider()
     render_oversize_warnings(report)
     st.divider()
     render_context_files(report)
@@ -1347,6 +1647,24 @@ def render_context_page() -> None:
 
 def render_scan_page(api_key: str) -> None:
     """渲染安全扫描与修复页面（原有功能）。"""
+    with st.expander("⚙️ 自定义规则配置", expanded=False):
+        raw_terms = st.text_area(
+            "禁用函数名或关键词",
+            placeholder="例如：eval, exec, os.system",
+            help=(
+                "支持逗号、分号或换行分隔；按整词匹配，大小写不敏感，"
+                "注释和字符串中的关键词也会命中。"
+            ),
+            key="custom_rule_terms",
+        )
+        custom_terms = parse_custom_terms(raw_terms)
+        if custom_terms:
+            preview = "、".join(custom_terms[:8])
+            more = f" 等 {len(custom_terms)} 项" if len(custom_terms) > 8 else ""
+            st.caption(f"已启用自定义规则：{preview}{more}")
+        else:
+            st.caption("留空则不启用自定义规则。")
+
     uploaded = st.file_uploader(
         "上传需要预检的 Python 文件或 .zip 压缩包",
         type=["py", "zip"],
@@ -1369,7 +1687,9 @@ def render_scan_page(api_key: str) -> None:
     content = uploaded.getvalue()
     with st.spinner("正在扫描，请稍候..."):
         try:
-            bundle = scan_uploaded_file(filename, content)
+            bundle = scan_uploaded_file(
+                filename, content, custom_terms=custom_terms
+            )
         except Exception as exc:  # 页面不应因单次扫描异常而崩溃
             st.error(f"扫描失败：{exc}")
             return
@@ -1393,8 +1713,12 @@ def render_scan_page(api_key: str) -> None:
     st.divider()
     render_issues(report)
     dependency_report = render_dependency_check(bundle.sources)
-    render_ai_fix(report, bundle.sources, api_key)
-    st.caption("⚠️ 预检结果与 AI 修复建议仅供参考，请结合人工复核后再合并代码。")
+    render_red_blue_fix(report, bundle.sources, api_key)
+    render_code_review_guide(report, bundle.sources, filename, api_key)
+    st.caption(
+        "⚠️ 预检结果、AI 修复/红蓝对抗建议与 Code Review 指南仅供参考，"
+        "请结合人工复核后再合并代码。"
+    )
     st.divider()
     render_security_export(report, filename, dependency_report)
 

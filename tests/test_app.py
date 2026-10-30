@@ -28,6 +28,13 @@ class AppIntegrationTestCase(unittest.TestCase):
                 "\n".join(["value = 1"] * 305) + "\n# TODO: split this file\n",
                 encoding="utf-8",
             )
+            (scan_root / "service_a.py").write_text(
+                '"""服务 A。"""\n\nimport big\n', encoding="utf-8"
+            )
+            (scan_root / "service_b.py").write_text(
+                '"""服务 B。"""\n\nfrom big import legacy_report_pipeline\n',
+                encoding="utf-8",
+            )
 
             with mock.patch.dict(os.environ, {"CONTEXT_SCAN_ROOT": str(scan_root)}):
                 at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=30)
@@ -129,6 +136,19 @@ class AppIntegrationTestCase(unittest.TestCase):
                 self.assertEqual(len(at.download_button), 1)
                 self.assertEqual(at.download_button[0].label, "📥 导出诊断报告")
 
+                # 依赖网络图：big.py 被两个服务文件引用，应为红色放大的核心节点。
+                plotly_charts = at.get("plotly_chart")
+                self.assertEqual(len(plotly_charts), 1)
+                graph_spec = json.loads(plotly_charts[0].proto.spec)
+                core_traces = [
+                    trace
+                    for trace in graph_spec["data"]
+                    if trace.get("name") == "核心节点（被引用最多）"
+                ]
+                self.assertEqual(len(core_traces), 1)
+                self.assertEqual(core_traces[0]["marker"]["color"], "#c62828")
+                self.assertGreater(core_traces[0]["marker"]["size"], 28)
+
                 # 切回安全扫描页，导航仍然正常。
                 at.radio[0].set_value(PAGE_SCAN).run()
                 self.assertFalse(at.exception)
@@ -167,7 +187,7 @@ class AppIntegrationTestCase(unittest.TestCase):
                 self.assertIn("pkg/user_service.py", set(issue_frame["文件"]))
                 self.assertEqual(at.download_button[0].label, "📥 导出诊断报告")
 
-    def test_ai_fix_backup_and_rollback(self) -> None:
+    def test_red_blue_backup_and_rollback(self) -> None:
         source = (
             '"""演示模块。"""\n\n'
             'API_TOKEN = "sk-live-abcdef123456"\n'
@@ -177,22 +197,38 @@ class AppIntegrationTestCase(unittest.TestCase):
             status_code = 200
             text = ""
 
+            def __init__(self, content: str):
+                self._content = content
+
             def json(self):
                 return {
-                    "choices": [
-                        {"message": {"content": 'API_TOKEN = "from-env"'}}
-                    ]
+                    "choices": [{"message": {"content": self._content}}]
                 }
 
         post_called = {"backup_existed": False}
+        red_calls = 0
 
         def fake_post(*args, **kwargs):
+            nonlocal red_calls
             workspace_value = at.session_state.get("fix_workspace_path")
             if workspace_value:
                 post_called["backup_existed"] = (
                     Path(workspace_value) / "demo.py.bak"
                 ).exists()
-            return FakeResponse()
+            messages = kwargs.get("json", {}).get("messages", [])
+            user_content = messages[1]["content"] if len(messages) > 1 else ""
+            if "顶级黑客" in user_content:
+                red_calls += 1
+                if red_calls == 1:
+                    return FakeResponse(
+                        "攻击思路：读取 API_TOKEN。\n【结论】攻破成功"
+                    )
+                return FakeResponse(
+                    "修复后无法构造有效攻击。\n【结论】无法攻破"
+                )
+            return FakeResponse(
+                "```python\nAPI_TOKEN = 'from-env'\n```"
+            )
 
         with mock.patch("requests.post", side_effect=fake_post):
             at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=30)
@@ -212,12 +248,32 @@ class AppIntegrationTestCase(unittest.TestCase):
             )
             api_input.set_value("test-key").run()
 
-            fix_button = next(
-                button for button in at.button if button.label == "🔧 一键 AI 修复"
+            self.assertIn(
+                "🔥 红蓝对抗修复", [item.value for item in at.subheader]
             )
-            fix_button.click().run()
+            red_blue_button = next(
+                button
+                for button in at.button
+                if button.label == "🔥 开启红蓝对抗修复"
+            )
+            red_blue_button.click().run()
             self.assertFalse(at.exception)
             self.assertTrue(post_called["backup_existed"])
+            self.assertEqual(red_calls, 2)
+
+            cache = at.session_state["red_blue_cache"]
+            self.assertTrue(cache)
+            entry = next(iter(cache.values()))
+            self.assertEqual(entry["status"], "defended")
+            self.assertIn("API_TOKEN", entry["fixed"])
+
+            markdown_values = [item.value for item in at.markdown]
+            self.assertTrue(
+                any("攻击思路" in text for text in markdown_values)
+            )
+            self.assertTrue(
+                any("API_TOKEN = 'from-env'" in text for text in markdown_values)
+            )
 
             backups = at.session_state["fix_backups"]
             self.assertIn("demo.py", backups)
@@ -244,7 +300,7 @@ class AppIntegrationTestCase(unittest.TestCase):
 
             self.assertFalse(at.exception)
             self.assertEqual(current.read_text(encoding="utf-8"), source)
-            self.assertEqual(at.session_state["ai_fix_cache"], {})
+            self.assertEqual(at.session_state["red_blue_cache"], {})
             self.assertIn(
                 "已回滚，请重新扫描确认",
                 [message.value for message in at.success],
@@ -253,6 +309,180 @@ class AppIntegrationTestCase(unittest.TestCase):
             workspace_tmp = at.session_state.get("fix_workspace_tmp")
             if workspace_tmp is not None:
                 workspace_tmp.cleanup()
+
+    def test_red_blue_stops_at_max_rounds(self) -> None:
+        source = (
+            '"""演示模块。"""\n\n'
+            'API_TOKEN = "sk-live-abcdef123456"\n'
+        )
+        calls = {"red": 0, "blue": 0}
+
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+            def __init__(self, content: str):
+                self._content = content
+
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": self._content}}]
+                }
+
+        def fake_post(url: str, **kwargs):
+            user_content = kwargs["json"]["messages"][1]["content"]
+            if "顶级黑客" in user_content:
+                calls["red"] += 1
+                return FakeResponse(
+                    "仍然可以读取 Token。\n【结论】攻破成功"
+                )
+            calls["blue"] += 1
+            return FakeResponse("```python\nSAFE = True\n```")
+
+        with mock.patch("requests.post", side_effect=fake_post):
+            at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=30)
+            at.run()
+            at.text_input[0].set_value("admin")
+            at.text_input[1].set_value("123456")
+            at.form_submit_button[0].click().run()
+            api_input = next(
+                widget
+                for widget in at.text_input
+                if widget.label == "DeepSeek API Key"
+            )
+            api_input.set_value("test-key").run()
+            at.file_uploader[0].set_value(
+                ("loop_demo.py", source.encode("utf-8"), "text/x-python")
+            ).run()
+            button = next(
+                item
+                for item in at.button
+                if item.label == "🔥 开启红蓝对抗修复"
+            )
+            button.click().run()
+
+            self.assertFalse(at.exception)
+            self.assertEqual(calls["red"], 3)
+            self.assertEqual(calls["blue"], 3)
+            entry = next(iter(at.session_state["red_blue_cache"].values()))
+            self.assertEqual(entry["status"], "max_rounds")
+            self.assertEqual(entry["rounds"], 3)
+            self.assertTrue(entry["fixed"])
+            self.assertTrue(
+                any(
+                    "最大轮次" in message.value or "上限" in message.value
+                    for message in at.warning
+                )
+            )
+            self.assertIn(
+                "⬇️ 下载最终修复代码",
+                [button.label for button in at.download_button],
+            )
+
+            workspace_tmp = at.session_state.get("fix_workspace_tmp")
+            if workspace_tmp is not None:
+                workspace_tmp.cleanup()
+
+    def test_custom_rule_marks_violation(self) -> None:
+        source = '"""演示模块。"""\n\nRESULT = eval("1 + 1")\n'
+        at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=30)
+        at.run()
+        at.text_input[0].set_value("admin")
+        at.text_input[1].set_value("123456")
+        at.form_submit_button[0].click().run()
+
+        self.assertEqual(
+            [widget.label for widget in at.text_area], ["禁用函数名或关键词"]
+        )
+        at.text_area[0].set_value("eval, exec").run()
+        at.file_uploader[0].set_value(
+            ("custom_demo.py", source.encode("utf-8"), "text/x-python")
+        ).run()
+
+        self.assertFalse(at.exception)
+        frame = at.dataframe[0].value
+        custom_rows = frame[frame["规则"] == "CUSTOM"]
+        self.assertGreaterEqual(len(custom_rows), 1)
+        self.assertEqual(custom_rows.iloc[0]["检查项"], "【自定义】违规")
+        self.assertIn("eval", custom_rows.iloc[0]["问题描述"])
+        self.assertEqual(custom_rows.iloc[0]["审查优先级"], "P1")
+
+    def test_generates_code_review_guide(self) -> None:
+        source = (
+            '"""演示模块。"""\n\n'
+            'API_TOKEN = "sk-live-abcdef123456"\n'
+        )
+        captured: dict = {}
+
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    "## 核心功能\n一句话总结。\n\n"
+                                    "## 审查顺序\n1. 先看 init_user。\n\n"
+                                    "## 风险点\n1. 硬编码密钥。"
+                                )
+                            }
+                        }
+                    ]
+                }
+
+        def fake_post(url: str, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return FakeResponse()
+
+        with mock.patch("requests.post", side_effect=fake_post):
+            at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=30)
+            at.run()
+            at.text_input[0].set_value("admin")
+            at.text_input[1].set_value("123456")
+            at.form_submit_button[0].click().run()
+            api_input = next(
+                widget
+                for widget in at.text_input
+                if widget.label == "DeepSeek API Key"
+            )
+            api_input.set_value("test-key").run()
+            at.file_uploader[0].set_value(
+                ("review_demo.py", source.encode("utf-8"), "text/x-python")
+            ).run()
+
+            self.assertIn(
+                "生成 Code Review 指南",
+                [button.label for button in at.button],
+            )
+            guide_button = next(
+                button
+                for button in at.button
+                if button.label == "生成 Code Review 指南"
+            )
+            guide_button.click().run()
+
+            self.assertFalse(at.exception)
+            messages = captured["json"]["messages"]
+            self.assertEqual(messages[0]["role"], "system")
+            self.assertIn("你是一个资深架构师", messages[1]["content"])
+            self.assertIn("核心功能一句话总结", messages[1]["content"])
+            self.assertIn("API_TOKEN", messages[1]["content"])
+
+            markdown_values = [item.value for item in at.markdown]
+            self.assertTrue(
+                any(
+                    "核心功能" in text and "审查顺序" in text
+                    for text in markdown_values
+                )
+            )
+            self.assertIn(
+                "⬇️ 下载 Code Review 指南",
+                [button.label for button in at.download_button],
+            )
+            self.assertIn("code_review_guide", at.session_state)
 
     def test_hallucinated_dependency_is_reported(self) -> None:
         source = (
