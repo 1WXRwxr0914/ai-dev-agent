@@ -327,7 +327,7 @@ def render_summary(report: ScanReport) -> None:
     st.progress(min(max(report.score, 0), 100) / 100)
 
 
-def build_severity_chart(report: ScanReport) -> alt.LayerChart | None:
+def build_severity_chart(report: ScanReport) -> alt.Chart | None:
     """构建高/中/低危漏洞占比环形图；没有问题时返回 None。"""
     counts = report.counts
     data = pd.DataFrame(
@@ -340,25 +340,39 @@ def build_severity_chart(report: ScanReport) -> alt.LayerChart | None:
     if total == 0:
         return None
     data["占比"] = data["数量"] / total
+    data["图例"] = [
+        f"{level} {int(count)} ({ratio:.0%})"
+        for level, count, ratio in zip(
+            data["级别"], data["数量"], data["占比"]
+        )
+    ]
     data["排序"] = range(len(data))
-    visible = data[data["数量"] > 0]
 
-    arcs = (
-        alt.Chart(visible)
-        .mark_arc(innerRadius=62, outerRadius=102, stroke="#ffffff", strokeWidth=2)
+    # 不再把百分比文字画在扇区外侧，避免小扇区（如 17%）标签被裁切；
+    # 数量与占比统一放到底部图例中展示。
+    return (
+        alt.Chart(data)
+        .mark_arc(
+            innerRadius=68,
+            outerRadius=112,
+            stroke="#ffffff",
+            strokeWidth=2,
+        )
         .encode(
             theta=alt.Theta("数量:Q", stack=True),
             order=alt.Order("排序:Q"),
             color=alt.Color(
-                "级别:N",
+                "图例:N",
                 scale=alt.Scale(
-                    domain=SEVERITY_ORDER,
+                    domain=data["图例"].tolist(),
                     range=[SEVERITY_COLORS[level] for level in SEVERITY_ORDER],
                 ),
                 legend=alt.Legend(
                     title=None,
                     orient="bottom",
                     direction="horizontal",
+                    columns=3,
+                    labelLimit=220,
                     symbolType="circle",
                     symbolSize=110,
                     labelFontSize=12,
@@ -371,25 +385,11 @@ def build_severity_chart(report: ScanReport) -> alt.LayerChart | None:
                 alt.Tooltip("占比:Q", title="占比", format=".1%"),
             ],
         )
-    )
-    labels = (
-        alt.Chart(visible)
-        .mark_text(
-            radius=121,
-            fontSize=11,
-            fontWeight="bold",
-            color=CHART_INK,
+        .properties(
+            height=350,
+            padding={"left": 30, "right": 30, "top": 20, "bottom": 20},
+            background="transparent",
         )
-        .encode(
-            theta=alt.Theta("数量:Q", stack=True),
-            order=alt.Order("排序:Q"),
-            text=alt.Text("占比:Q", format=".0%"),
-        )
-    )
-    return (
-        alt.layer(arcs, labels)
-        .resolve_scale(theta="shared")
-        .properties(height=280, background="transparent")
         .configure_view(strokeWidth=0)
     )
 
@@ -403,8 +403,7 @@ def render_severity_chart(report: ScanReport) -> None:
         return
     st.altair_chart(chart, width="stretch", theme=None)
     st.caption(
-        f"共 {report.total_issues} 个问题：高危 {report.counts['high']} · "
-        f"中危 {report.counts['medium']} · 低危 {report.counts['low']}。"
+        f"共 {report.total_issues} 个问题；底部图例展示各级别的数量与占比。"
     )
 
 
@@ -931,7 +930,7 @@ def _render_battle_event(event: dict) -> None:
     role = event.get("role")
     content = event.get("content", "")
     if role == "red":
-        with st.chat_message("红方攻击", avatar="🔴"):
+        with st.chat_message("红方攻击", avatar="⚔️"):
             st.markdown(content)
     elif role == "blue":
         with st.chat_message("蓝方防御", avatar="🛡️"):
@@ -1096,7 +1095,7 @@ def render_red_blue_fix(
         f"每个问题最多进行 **{MAX_ROUNDS}** 轮红蓝对抗，每轮会调用两次 DeepSeek。"
     )
     st.caption(
-        "🔴 红方输出仅用于授权的防御性验证，请勿在任何真实系统上执行。"
+        "⚔️ 红方输出仅用于授权的防御性验证，请勿在任何真实系统上执行。"
     )
 
     if not api_key:
